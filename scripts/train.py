@@ -1,3 +1,4 @@
+# File: scripts/train.py
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
 import os
@@ -16,7 +17,7 @@ import yaml
 from transformers import BertTokenizer
 from data.dataset import PoegraphLayoutDataset, layout_collate_fn 
 from models.poem2layout import Poem2LayoutGenerator
-import trainers # FIXED: 导入整个 trainers 包，依赖 trainers/__init__.py 
+import trainers 
 from collections import Counter
 import numpy as np 
 
@@ -80,16 +81,20 @@ def main():
         max_text_length=model_config['max_text_length']
     )
     
-    # --- NEW: 计算类别权重 ---
+    # --- 计算类别权重 ---
     num_element_classes = model_config['num_classes'] # 9
     class_weights_tensor = compute_class_weights(dataset, num_element_classes)
     print(f"Calculated Class Weights (Internal 0-8): {class_weights_tensor.tolist()}")
     # ---------------------------
 
-    # 3. Init model (传入 IoU 权重和类别权重)
+    # 3. Init model (传入 BBox 离散化参数, IoU 权重和类别权重)
     model = Poem2LayoutGenerator(
         bert_path=model_config['bert_path'],
         num_classes=num_element_classes, # 实际元素类别数 (9)
+        # --- NEW: BBox Discrete Parameters ---
+        num_bbox_bins=model_config['num_bbox_bins'],
+        bbox_embed_dim=model_config['bbox_embed_dim'],
+        # --------------------------------------
         hidden_size=model_config['hidden_size'],
         bb_size=model_config['bb_size'],
         decoder_layers=model_config['decoder_layers'],
@@ -97,15 +102,22 @@ def main():
         dropout=model_config['dropout'],
         coord_loss_weight=model_config['coord_loss_weight'],
         # --- 传入解决堆叠和类别偏差问题的关键参数 ---
-        iou_loss_weight=model_config.get('iou_loss_weight', 0.1), 
+        iou_loss_weight=model_config.get('iou_loss_weight', 1.0), 
         class_weights=class_weights_tensor 
         # -----------------------------------------
     )
 
     # 4. Split dataset and init data loaders
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    total_size = len(dataset)
+    train_size = int(0.8 * total_size) # 80%
+    val_size = int(0.1 * total_size)   # 10%
+    test_size = total_size - train_size - val_size # 剩余为 10%
+
+    # 执行 80/10/10 随机划分
+    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size, test_size]
+    )
+    print(f"Dataset split: Train={train_size}, Validation={val_size}, Test={test_size}")
 
     train_loader = DataLoader(
         train_dataset,
@@ -119,9 +131,23 @@ def main():
         shuffle=False,
         collate_fn=layout_collate_fn 
     )
-
+    # 增加测试集加载器
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config['training']['batch_size'],
+        shuffle=False,
+        collate_fn=layout_collate_fn 
+    )
+    
+    # --- 获取 tokenizer 和一个固定样例 ---
+    tokenizer = dataset.tokenizer 
+    # 从验证集中选择第一个样例
+    example_idx_in_full_dataset = val_dataset.indices[0]
+    example_poem = dataset.data[example_idx_in_full_dataset]
+    
     # 5. Init trainer and start training
-    trainer = trainers.LayoutTrainer(model, train_loader, val_loader, config)
+    # 将 test_loader 传递给 Trainer
+    trainer = trainers.LayoutTrainer(model, train_loader, val_loader, config, tokenizer, example_poem, test_loader)
     trainer.train()
 
 if __name__ == "__main__":

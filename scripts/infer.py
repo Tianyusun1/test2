@@ -46,7 +46,7 @@ def main():
     # 4. Load checkpoint
     # 移除硬编码：使用配置中的 output_dir，并要求用户设置 CHECKPOINT_NAME
     output_dir = config['training']['output_dir']
-    CHECKPOINT_NAME = "model_epoch_99_val_loss_0.5050.pth" # <<< TODO: 请用户在此设置正确的权重文件名
+    CHECKPOINT_NAME = "model_epoch_100.pth" # <<< TODO: 请用户在此设置正确的权重文件名
     
     checkpoint_path = os.path.join(output_dir, CHECKPOINT_NAME)
     
