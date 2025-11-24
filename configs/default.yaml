@@ -1,0 +1,35 @@
+# Poem2Layout Configuration
+
+model:
+  # BERT encoder
+  bert_path: "/home/610-sty/huggingface/bert-base-chinese"
+  hidden_size: 768  # BERT hidden size
+  # Layout decoder
+  bb_size: 64       # Layout embedding size (for cls + bbox)
+  decoder_layers: 4
+  decoder_heads: 8
+  dropout: 0.1
+  # Output
+  num_classes: 9    # 2~10 mapped to 0~8
+  coord_loss_weight: 1.0 # Weight for bbox regression loss
+  # Inference
+  max_elements: 30  # Max number of elements to generate
+  # Data paths (Added back)
+  xlsx_path: "/home/610-sty/Layout2Paint/dataset/6800poems.xlsx"
+  images_dir: "/home/610-sty/Layout2Paint/dataset/6800"
+  labels_dir: "/home/610-sty/Layout2Paint/dataset/6800/JPEGImages-pre_new_txt"
+  max_layout_length: 30
+  max_text_length: 64
+
+training:
+  batch_size: 16
+  epochs: 100
+  learning_rate: 0.0001
+  warmup_steps: 1000
+  save_every: 10
+  output_dir: "./outputs"
+  log_steps: 10
+
+inference:
+  max_output_length: 30
+  # beam_size: 1  # Only greedy for now
