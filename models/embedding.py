@@ -4,11 +4,11 @@ import torch.nn as nn
 class PoemLayoutEmbedding(nn.Module):
     """
     将类别 ID 和 YOLO 格式坐标 (cx, cy, w, h) 转换为向量嵌入。
-    复用 LayoutTransformer 中 ConcatBox_Embeddings 的思想。
     """
     def __init__(self, num_classes: int, bb_size: int, dropout: float = 0.1):
         super(PoemLayoutEmbedding, self).__init__()
         self.bb_size = bb_size
+        # 注意: num_classes 必须是 布局元素数 + 特殊 token 数
         self.cls_embed = nn.Embedding(num_classes, bb_size - 4) # -4 for raw bbox
         self.dropout = nn.Dropout(dropout)
 

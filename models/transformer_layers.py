@@ -70,7 +70,7 @@ class ContMultiHeadedAttention(nn.Module):
         # Layers for Q, K, V with potentially different input sizes
         self.k_layer = nn.Linear(size_k, num_heads * head_size_k)
         self.v_layer = nn.Linear(size_v, num_heads * head_size_v)
-        self.q_layer = nn.Linear(size_q, num_heads * head_size_k) # Often size_q == size_k for self-att, but allow diff for cross-att
+        self.q_layer = nn.Linear(size_q, num_heads * head_size_k) # Dh_q assumed same as Dh_k for matmul
         # Output layer maps back to the original V space
         self.output_layer = nn.Linear(num_heads * head_size_v, size_v)
         self.softmax = nn.Softmax(dim=-1)
@@ -111,14 +111,7 @@ class ContMultiHeadedAttention(nn.Module):
                 scores = scores.masked_fill(mask_expanded == float('-inf'), float('-inf'))
         attention = self.softmax(scores) # [B, H, L_q, L_k]
         attention = self.dropout(attention)
-        # Context: [B, H, L_q, L_k] x [B, H, L_v, Dh_v] -> [B, H, L_q, Dh_v] (L_k must equal L_v for matmul)
-        # Note: In standard cross-attention, L_k == L_v (sequence length of K/V)
-        # Here, L_k is from k.shape[1], L_v is from v.shape[1]. For cross-attention, they should be the same seq length.
-        # If k and v come from the same source (e.g., text_memory), their seq lengths (L_k, L_v) are the same.
-        # If they come from different sources with different seq lengths, this will fail.
-        # The current usage in PoemLayoutDecoderLayer assumes L_k (from text_memory) == L_v (from text_memory or layout_out).
-        # For layout_text_attn: k=text_memory[B, L_text, H], v=text_memory[B, L_text, H] -> OK, L_k=L_v=L_text
-        # For text_layout_attn: k=layout_out[B, T, bb], v=layout_out[B, T, bb] -> OK, L_k=L_v=T
+        # Context: [B, H, L_q, L_k] x [B, H, L_v, Dh_v] -> [B, H, L_q, Dh_v] 
         context = torch.matmul(attention, v) # [B, H, L_q, Dh_v]
         # Reshape back: [B, H, L_q, Dh_v] -> [B, L_q, H * Dh_v]
         context = context.transpose(1, 2).contiguous().view(
@@ -203,35 +196,28 @@ class PoemLayoutDecoderLayer(nn.Module):
         # layout_x: [B, T, bb_size]
         # text_x: [B, T, hidden_size]
         # text_memory: [B, L_text, hidden_size]
-        # src_mask: [B, 1, 1, L_text] -> expands in decoder.py to [B, 1, T, L_text]
-        # trg_mask: [T, T] -> expands in decoder.py to [1, 1, T, T]
-
+        
         # 1. Layout self-attention: Q=K=V=layout_norm1
         layout_norm1 = self.layout_norm1(layout_x)
-        layout_self_out = self.layout_self_attn(layout_norm1, layout_norm1, layout_norm1, mask=trg_mask) # Uses [1, 1, T, T]
+        layout_self_out = self.layout_self_attn(layout_norm1, layout_norm1, layout_norm1, mask=trg_mask)
         layout_self_out = self.dropout(layout_self_out) + layout_x # Residual: [B, T, bb_size]
 
         # 2. Layout attends to Text: Q=layout_norm2, K=V=text_memory
         layout_norm2 = self.layout_norm2(layout_self_out)
-        layout_text_out = self.layout_text_attn(text_memory, text_memory, layout_norm2, mask=src_mask) # Uses [B, 1, T, L_text]
+        layout_text_out = self.layout_text_attn(text_memory, text_memory, layout_norm2, mask=src_mask)
         # Project back to bb_size before residual connection
         layout_text_out_proj = self.layout_text_proj(layout_text_out) # [B, T, hidden_size] -> [B, T, bb_size]
-        layout_out_pre_ffn = self.dropout(layout_text_out_proj) + layout_self_out # [B, T, bb_size] + [B, T, bb_size]
+        layout_out_pre_ffn = self.dropout(layout_text_out_proj) + layout_self_out
         layout_out = self.layout_ffn(layout_out_pre_ffn) # -> [B, T, bb_size]
 
         # 3. Text attends to Layout: Q=text_norm1, K=V=layout_out
         text_norm1 = self.text_norm1(text_x)
-        # K, V from layout_out [B, T, bb_size], Q from text_norm1 [B, T, hidden_size]
-        # The mask trg_mask [1, 1, T, T] was originally intended for layout_self_attn.
-        # Using it here for text_layout_attn implies a causal relationship between text_x and layout_out,
-        # which is conceptually incorrect for a standard cross-attention.
-        # Cross-attention typically does not use a causal mask like self-attention.
-        # The original line `mask=trg_mask.transpose(-2, -1)` was also incorrect.
-        # Corrected: Do not apply trg_mask to this cross-attention.
-        text_layout_out = self.text_layout_attn(layout_out, layout_out, text_norm1, mask=None) # Removed trg_mask
+        # NOTE: mask=None is correct here, as causal mask is typically not applied
+        # in standard cross-attention between two streams (Text Query -> Layout K/V).
+        text_layout_out = self.text_layout_attn(layout_out, layout_out, text_norm1, mask=None)
         # Project back to hidden_size before residual connection
         text_layout_out_to_hidden = self.text_layout_proj(text_layout_out) # [B, T, bb_size] -> [B, T, hidden_size]
-        text_out_pre_ffn = self.dropout(text_layout_out_to_hidden) + text_x # [B, T, hidden_size] + [B, T, hidden_size]
+        text_out_pre_ffn = self.dropout(text_layout_out_to_hidden) + text_x
         text_out = self.text_ffn(text_out_pre_ffn) # -> [B, T, hidden_size]
 
         return layout_out, text_out # [B, T, bb_size], [B, T, hidden_size]

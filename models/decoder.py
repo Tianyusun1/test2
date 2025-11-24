@@ -8,7 +8,7 @@ class LayoutDecoder(nn.Module):
         if ff_size is None:
             ff_size = hidden_size * 4
         self.bb_size = bb_size
-        # Renamed from 'layers' to 'layers' to be a clear nn.ModuleList attribute
+        
         self.layers = nn.ModuleList([
             PoemLayoutDecoderLayer(
                 hidden_size=hidden_size,
@@ -18,12 +18,8 @@ class LayoutDecoder(nn.Module):
                 dropout=dropout
             ) for _ in range(num_layers)
         ])
-        # The output size of each layer is [B, T, hidden_size + bb_size] after concatenation inside the layer
-        # So, the final layer norm input size is hidden_size + bb_size
-        # Note: The original PoemLayoutDecoderLayer did not return concatenated output.
-        # It returned (layout_out, text_out) separately.
-        # So, the final concatenation and layer norm should happen here in LayoutDecoder.
-        # Final output size will be [B, T, hidden_size + bb_size]
+        
+        # The final layer norm input size is hidden_size + bb_size
         self.layer_norm = nn.LayerNorm(hidden_size + bb_size, eps=1e-6)
         self.dropout = nn.Dropout(dropout)
 
@@ -33,20 +29,20 @@ class LayoutDecoder(nn.Module):
         B, T, bb_size_dim = layout_embed.shape
         B_text, L_text, hidden_size_dim = text_features.shape
 
-        # Expand text features to match layout sequence length T
-        # A simple way: repeat the [CLS] token (or mean pool) T times
-        # Or use interpolation if alignment is critical
-        # Here we use the first token (often [CLS]) and repeat
-        text_repr_for_layout = text_features[:, 0:1, :].expand(-1, T, -1) # [B, T, hidden_size]
-
+        # === 关键修复区域 ===
+        # 1. 移除 BUG：原代码错误地将 [CLS] token 重复 T 次作为 text_x 的初始值。
+        # 2. 修复：将 text_x 初始化为零向量 (Zero Tensor)，避免 [CLS] token 污染自注意力上下文。
+        
+        # text_x 流在初始时应为零，其信息将通过 PoemLayoutDecoderLayer 内部的 Cross-Attention 从 text_features 中获取。
+        text_x = torch.zeros(B, T, hidden_size_dim, device=layout_embed.device) 
+        
         layout_x = layout_embed # [B, T, bb_size]
-        text_x = text_repr_for_layout # [B, T, hidden_size]
+        # 原有的 BUG 赋值语句 text_x = text_repr_for_layout 已被移除。
+        # ==================
 
         # Iterate through the stack of layers
-        for layer in self.layers: # self.layers is the nn.ModuleList
-            # Call the fixed PoemLayoutDecoderLayer
-            # Input: layout_x [B, T, bb_size], text_x [B, T, hidden_size], text_memory [B, L_text, hidden_size], src_mask, trg_mask
-            # Output: new_layout_x [B, T, bb_size], new_text_x [B, T, hidden_size]
+        for layer in self.layers:
+            # layout_x 和 text_x 都是 Query，text_features 是 Memory
             layout_x, text_x = layer(layout_x, text_x, text_features, src_mask, trg_mask)
 
         # After all layers, concatenate the final streams

@@ -1,134 +1,129 @@
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from tqdm import tqdm # Import tqdm
+# --- 强制添加项目根目录到 Python 模块搜索路径 ---
+import sys
 import os
+
+# 获取当前脚本 (train.py) 的绝对路径
+current_script_path = os.path.abspath(__file__)
+# 获取项目根目录 (train.py 的父目录)
+project_root = os.path.dirname(os.path.dirname(current_script_path))
+# 将项目根目录插入到 sys.path 的开头
+sys.path.insert(0, project_root)
+
+# --- 现在可以安全地导入项目内部模块 ---
+import torch
+from torch.utils.data import DataLoader
+import yaml
+from transformers import BertTokenizer
+# 确保导入正确的 collate function
+from data.dataset import PoegraphLayoutDataset, layout_collate_fn 
 from models.poem2layout import Poem2LayoutGenerator
-# from trainers.loss import layout_loss # Not used directly in this trainer anymore, as model handles it
+from trainers.trainer import LayoutTrainer
+from collections import Counter
+import numpy as np # <-- NEW: 需要 numpy 来处理权重计算
 
-class LayoutTrainer:
-    def __init__(self, model: Poem2LayoutGenerator, train_loader: DataLoader, val_loader: DataLoader, config: dict):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = model.to(self.device)
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.config = config
+# --- 辅助函数：计算类别权重 (解决类别偏差问题) ---
+def compute_class_weights(dataset, num_classes: int):
+    """
+    计算数据集内所有布局元素的类别频率，并返回反向频率权重。
+    权重公式: w_i = 1.0 / log(1.02 + p_i)
+    """
+    class_counts = Counter()
+    
+    # 遍历整个数据集计算所有元素实例的类别计数
+    for sample in dataset.data:
+        # boxes 是 List[(cls_id, cx, cy, w, h)]，cls_id 是 2.0 - 10.0
+        for cls_id_float, _, _, _, _ in sample['boxes']:
+            # 映射到内部 ID 0-8
+            internal_cls_id = int(cls_id_float) - 2
+            if 0 <= internal_cls_id < num_classes:
+                class_counts[internal_cls_id] += 1
+                
+    total_count = sum(class_counts.values())
+    
+    if total_count == 0:
+        print("[Warning] No valid elements found in dataset for weight calculation. Using uniform weights.")
+        return torch.ones(num_classes)
 
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=config['training']['learning_rate'],
-            weight_decay=0.01
-        )
-        # Optional: Add scheduler
-        # from transformers import get_linear_schedule_with_warmup
-        # self.scheduler = get_linear_schedule_with_warmup(
-        #     self.optimizer, # Fixed typo: optAimizer -> optimizer
-        #     num_training_steps=len(train_loader) * config['training']['epochs'],
-        #     num_warmup_steps=config['training']['warmup_steps']
-        # )
+    weights = torch.zeros(num_classes)
+    
+    # 计算频率 p_i
+    for i in range(num_classes):
+        frequency = class_counts.get(i, 0) / total_count
+        if frequency > 0:
+            # 采用 log(1.0 + x) 或 log(1.02 + x) 来平滑和反转频率
+            weights[i] = 1.0 / np.log(1.02 + frequency) 
+        else:
+            # 对于稀有/不存在的类别，赋予最高的权重
+            weights[i] = 1.0 / np.log(1.02 + 1e-6) # 赋予最大权重
+            
+    # 标准化权重 (可选，但通常有助于稳定训练)
+    weights = weights / weights.sum() * num_classes
+    
+    return weights.float()
+# ------------------------------------------
 
-        self.output_dir = config['training']['output_dir']
-        os.makedirs(self.output_dir, exist_ok=True)
 
-    def train_epoch(self, epoch):
-        self.model.train()
-        total_loss = 0
-        total_cls_loss = 0
-        total_coord_loss = 0
-        num_batches = 0
+def main():
+    # 1. Load config
+    config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs/default.yaml")
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
 
-        # Use tqdm with default bar format, update postfix for loss
-        pbar = tqdm(self.train_loader, desc=f"Training Epoch {epoch}")
-        for batch in pbar:
-            self.optimizer.zero_grad()
+    # 2. Init tokenizer and load FULL dataset for weight calculation
+    model_config = config['model']
+    
+    # 重新初始化数据集以确保数据完整性
+    dataset = PoegraphLayoutDataset(
+        xlsx_path=model_config['xlsx_path'],
+        labels_dir=model_config['labels_dir'],
+        bert_model_path=model_config['bert_path'],
+        max_layout_length=model_config['max_layout_length'],
+        max_text_length=model_config['max_text_length']
+    )
+    
+    # --- NEW: 计算类别权重 ---
+    num_element_classes = model_config['num_classes'] # 9
+    class_weights_tensor = compute_class_weights(dataset, num_element_classes)
+    print(f"Calculated Class Weights (Internal 0-8): {class_weights_tensor.tolist()}")
+    # ---------------------------
 
-            input_ids = batch['input_ids'].to(self.device)
-            attention_mask = batch['attention_mask'].to(self.device)
-            layout_seq = batch['layout_seq'].to(self.device)
-            layout_mask = batch['layout_mask'].to(self.device)
+    # 3. Init model (传入 IoU 权重和类别权重)
+    model = Poem2LayoutGenerator(
+        bert_path=model_config['bert_path'],
+        num_classes=num_element_classes, # 实际元素类别数 (9)
+        hidden_size=model_config['hidden_size'],
+        bb_size=model_config['bb_size'],
+        decoder_layers=model_config['decoder_layers'],
+        decoder_heads=model_config['decoder_heads'],
+        dropout=model_config['dropout'],
+        coord_loss_weight=model_config['coord_loss_weight'],
+        # --- 传入解决堆叠和类别偏差问题的关键参数 ---
+        iou_loss_weight=model_config.get('iou_loss_weight', 0.1), 
+        class_weights=class_weights_tensor 
+        # -----------------------------------------
+    )
 
-            # --- CRITICAL SLICING ---
-            model_input_seq = layout_seq[:, :-5] # [B, S-5]
-            target_layout_seq = layout_seq[:, 5:] # [B, S-5]
-            target_layout_mask = layout_mask[:, 5:] # [B, S-5]
+    # 4. Split dataset and init data loaders
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
 
-            pred_cls, pred_coord = self.model(input_ids, attention_mask, model_input_seq) # Teacher forcing: input is [start, ..., end-5]
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['training']['batch_size'],
+        shuffle=True,
+        collate_fn=layout_collate_fn 
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config['training']['batch_size'],
+        shuffle=False,
+        collate_fn=layout_collate_fn 
+    )
 
-            # Calculate loss
-            loss, cls_loss, coord_loss = self.model.get_loss(pred_cls, pred_coord, target_layout_seq, target_layout_mask)
+    # 5. Init trainer and start training
+    trainer = LayoutTrainer(model, train_loader, val_loader, config)
+    trainer.train()
 
-            loss.backward()
-            self.optimizer.step()
-            # if self.scheduler:
-            #     self.scheduler.step()
-
-            total_loss += loss.item()
-            total_cls_loss += cls_loss.item()
-            total_coord_loss += coord_loss.item()
-            num_batches += 1
-
-            # Update postfix (this shows Loss=xxx at the end of the progress bar)
-            pbar.set_postfix({'Loss': loss.item()})
-
-        avg_loss = total_loss / num_batches
-        avg_cls_loss = total_cls_loss / num_batches
-        avg_coord_loss = total_coord_loss / num_batches
-        print(f"Epoch {epoch} - Train Loss: {avg_loss:.4f}, Cls: {avg_cls_loss:.4f}, Coord: {avg_coord_loss:.4f}")
-
-    @torch.no_grad()
-    def validate_epoch(self, epoch):
-        self.model.eval()
-        total_loss = 0
-        total_cls_loss = 0
-        total_coord_loss = 0
-        num_batches = 0
-
-        # Use tqdm for validation as well, with postfix
-        for batch in tqdm(self.val_loader, desc=f"Validating Epoch {epoch}"):
-            input_ids = batch['input_ids'].to(self.device)
-            attention_mask = batch['attention_mask'].to(self.device)
-            layout_seq = batch['layout_seq'].to(self.device)
-            layout_mask = batch['layout_mask'].to(self.device)
-
-            # --- CRITICAL SLICING ---
-            model_input_seq = layout_seq[:, :-5] # [B, S-5]
-            target_layout_seq = layout_seq[:, 5:] # [B, S-5]
-            target_layout_mask = layout_mask[:, 5:] # [B, S-5]
-
-            pred_cls, pred_coord = self.model(input_ids, attention_mask, model_input_seq)
-
-            # Calculate loss
-            loss, cls_loss, coord_loss = self.model.get_loss(pred_cls, pred_coord, target_layout_seq, target_layout_mask)
-
-            total_loss += loss.item()
-            total_cls_loss += cls_loss.item()
-            total_coord_loss += coord_loss.item()
-            num_batches += 1
-
-        avg_loss = total_loss / num_batches
-        avg_cls_loss = total_cls_loss / num_batches
-        avg_coord_loss = total_coord_loss / num_batches
-        print(f"Epoch {epoch} - Val Loss: {avg_loss:.4f}, Cls: {avg_cls_loss:.4f}, Coord: {avg_coord_loss:.4f}")
-        return avg_loss
-
-    def train(self):
-        # We no longer track best_val_loss or save best model every epoch
-        # Remove: best_val_loss = float('inf')
-
-        for epoch in range(self.config['training']['epochs']):
-            self.train_epoch(epoch)
-            val_loss = self.validate_epoch(epoch)
-
-            # Only save checkpoints every 10 epochs (or at the end)
-            if (epoch + 1) % 10 == 0 or (epoch + 1) == self.config['training']['epochs']:
-                checkpoint_path = os.path.join(self.output_dir, f"model_epoch_{epoch}_val_loss_{val_loss:.4f}.pth")
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': self.model.state_dict(),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'val_loss': val_loss,
-                }, checkpoint_path)
-                print(f"Checkpoint saved: {checkpoint_path}")
-            # else:
-            #     # Remove the other save logic that was here previously
-            #     pass
+if __name__ == "__main__":
+    main()
