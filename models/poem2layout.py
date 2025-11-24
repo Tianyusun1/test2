@@ -9,8 +9,8 @@ from .decoder import LayoutDecoder
 
 class Poem2LayoutGenerator(nn.Module):
     # num_classes: 实际的布局元素类别数 (例如：9)
-    # **修改: 增加 reg_loss_weight 参数**
-    def __init__(self, bert_path: str, num_classes: int, num_bbox_bins: int, bbox_embed_dim: int, hidden_size: int = 768, bb_size: int = 64, decoder_layers: int = 4, decoder_heads: int = 8, dropout: float = 0.1, coord_loss_weight: float = 1.0, iou_loss_weight: float = 0.1, reg_loss_weight: float = 1.0, class_weights: torch.Tensor = None):
+    # **修改 1: 增加 cls_loss_weight 和 count_loss_weight 参数**
+    def __init__(self, bert_path: str, num_classes: int, num_bbox_bins: int, bbox_embed_dim: int, hidden_size: int = 768, bb_size: int = 64, decoder_layers: int = 4, decoder_heads: int = 8, dropout: float = 0.1, coord_loss_weight: float = 1.0, iou_loss_weight: float = 0.1, reg_loss_weight: float = 1.0, cls_loss_weight: float = 1.0, count_loss_weight: float = 1.0, class_weights: torch.Tensor = None):
         super(Poem2LayoutGenerator, self).__init__()
         
         self.num_element_classes = num_classes 
@@ -20,7 +20,9 @@ class Poem2LayoutGenerator(nn.Module):
         self.bb_size = bb_size
         self.coord_loss_weight = coord_loss_weight
         self.iou_loss_weight = iou_loss_weight
-        self.reg_loss_weight = reg_loss_weight # **新增: 存储回归损失权重**
+        self.reg_loss_weight = reg_loss_weight 
+        self.cls_loss_weight = cls_loss_weight # <<<< 存储 cls_loss_weight
+        self.count_loss_weight = count_loss_weight # <<<< 存储 count_loss_weight
         
         if class_weights is not None:
             self.register_buffer('class_weights', class_weights)
@@ -43,6 +45,14 @@ class Poem2LayoutGenerator(nn.Module):
             nn.Dropout(dropout)
         )
         # -------------------------
+        
+        # **修改 2: 新增 数量预测头 (Count Prediction Head)**
+        self.count_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, 1) # 输出一个标量，预测数量
+        )
         
         # 实例化 Layout Embedding，传入所有 BBox 相关的配置参数
         self.layout_embedding = PoemLayoutEmbedding(
@@ -76,7 +86,7 @@ class Poem2LayoutGenerator(nn.Module):
         # **新增：4 个 BBox 坐标的连续回归头 (用于 L_reg)**
         self.reg_head = nn.Linear(decoder_output_size, 4)
 
-    # **修改: forward 返回 pred_cls, pred_bbox_ids (离散分类), pred_coord_float (连续回归)**
+    # **修改 3: forward 返回 pred_cls, pred_bbox_ids, pred_coord_float, pred_count**
     def forward(self, input_ids, attention_mask, layout_seq, kg_vectors):
         # layout_seq: [B, S] 现包含整数 ID (类别 ID, cx_id, cy_id, w_id, h_id)
         batch_size, seq_len = layout_seq.shape
@@ -86,6 +96,10 @@ class Poem2LayoutGenerator(nn.Module):
 
         # 1. 获取 BERT 文本特征 [B, L_text, H]
         text_encoded = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state 
+        
+        # **修改 4: 数量预测**
+        # 使用 [CLS] token 的输出 (text_encoded[:, 0, :]) 进行数量预测
+        pred_count = self.count_head(text_encoded[:, 0, :]) # [B, 1]
 
         # 2. --- NEW: 注入 KG 特征 ---
         # kg_vectors: [B, 9] -> projection -> [B, H]
@@ -126,8 +140,8 @@ class Poem2LayoutGenerator(nn.Module):
         # 使用 sigmoid 激活函数将输出钳位到 [0, 1] 范围
         pred_coord_float = torch.sigmoid(self.reg_head(decoder_output)) # [B, num_elements, 4]
 
-        # **修改返回值为 3 个预测结果**
-        return pred_cls, pred_bbox_ids, pred_coord_float
+        # **修改 5: 返回值增加 pred_count**
+        return pred_cls, pred_bbox_ids, pred_coord_float, pred_count
 
     def generate_square_subsequent_mask(self, sz):
         mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
@@ -226,10 +240,10 @@ class Poem2LayoutGenerator(nn.Module):
 
         return iou_loss
 
-    # **修改: get_loss 接受 pred_coord_float，并计算 L_reg 和 L_iou**
-    def get_loss(self, pred_cls, pred_bbox_ids, pred_coord_float, target_layout_seq, target_layout_mask):
+    # **修改 6: get_loss 接收 pred_count 和 target_num_boxes**
+    def get_loss(self, pred_cls, pred_bbox_ids, pred_coord_float, pred_count, target_layout_seq, target_layout_mask, target_num_boxes): # <<<< 增加参数
         """
-        Calculates the combined Hybrid loss for class prediction, BBox token prediction, and BBox continuous regression.
+        Calculates the combined Hybrid loss for class prediction, BBox token prediction, BBox continuous regression, and Count prediction.
         """
         batch_size, seq_len_decoded = target_layout_seq.shape 
         num_elements_decoded = seq_len_decoded // 5 
@@ -325,9 +339,18 @@ class Poem2LayoutGenerator(nn.Module):
             iou_threshold=0.5
         )
         
-        # --- 5. Combine Losses ---
-        # **修改: 整合 L_reg**
-        total_loss = cls_loss + self.coord_loss_weight * coord_loss + self.reg_loss_weight * reg_loss + self.iou_loss_weight * iou_loss
+        # --- 5. Count Prediction Loss (L_count) ---
+        # **修改 7: 计算 L_count**
+        target_count = target_num_boxes.float().unsqueeze(1) # [B, 1]
+        count_loss = F.smooth_l1_loss(pred_count, target_count)
         
-        # **修改返回值为 5 个损失项**
-        return total_loss, cls_loss, coord_loss, reg_loss, iou_loss
+        # --- 6. Combine Losses ---
+        # **修改 8: L_total 增加 L_count (应用各自的权重)**
+        total_loss = (self.cls_loss_weight * cls_loss) + \
+                     (self.coord_loss_weight * coord_loss) + \
+                     (self.reg_loss_weight * reg_loss) + \
+                     (self.iou_loss_weight * iou_loss) + \
+                     (self.count_loss_weight * count_loss)
+        
+        # **修改 9: 返回值增加 count_loss**
+        return total_loss, cls_loss, coord_loss, reg_loss, iou_loss, count_loss

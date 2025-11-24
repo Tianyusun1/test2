@@ -56,12 +56,21 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements: int = 2
     range_divisor = num_bins - 1
     # --------------------------------
 
-    # --- NEW: 提取 KG 向量 ---
+    # --- NEW: 提取 KG 向量 (关键修改) ---
     # 1. 实例化 KG
     pkg = PoetryKnowledgeGraph() 
-    # 2. 提取特征，并调整形状为 [1, 9] 并移动到设备
-    kg_vector = pkg.extract_visual_feature_vector(poem).unsqueeze(0).to(device) 
-    # -------------------------
+    # 2. 提取特征 (原始 9 维 CPU Tensor)
+    kg_vector_raw = pkg.extract_visual_feature_vector(poem) 
+    # 3. 调整形状并移动到设备 (供模型使用)
+    kg_vector = kg_vector_raw.unsqueeze(0).to(device) 
+
+    # NEW: 打印 KG 向量 (用于调试)
+    print("\n-------------------- KG DEBUG (Inference) ---------------------")
+    print(f"Inference Poem: '{poem}'")
+    # 内部 ID 0-8 对应原始 ID 2-10 (2:mountain, 3:water, ..., 10:animal)
+    print(f"KG Vector (ID 2-10): {kg_vector_raw.tolist()}") 
+    print("---------------------------------------------------------------")
+    # -------------------------------------
 
     # 1. Setup text encoding and masks
     with torch.no_grad():
@@ -74,7 +83,7 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements: int = 2
         
         # --- NEW: 注入 KG 特征 (与 model.forward 逻辑一致) ---
         # kg_feat: [1, 9] -> projection -> [1, H]
-        kg_feat = model.kg_projection(kg_vector)
+        kg_feat = model.kg_projection(kg_vector) # <--- 使用移动到设备的 kg_vector
         # Augment text features: [1, L_text, H] + [1, 1, H] -> [1, L_text, H]
         text_features = text_features + kg_feat.unsqueeze(1)
         # -----------------------------------------------------
@@ -127,23 +136,23 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements: int = 2
             generated_cls_ids = torch.cat([generated_cls_ids, next_cls_id.unsqueeze(1)], dim=1)
             generated_bboxes = torch.cat([generated_bboxes, next_bbox_ids.unsqueeze(1)], dim=1) # <--- Use LongTensor IDs
 
-    # 4. Final Extraction and Mapping
-    final_cls_ids = generated_cls_ids[0, 1:] 
-    final_bbox_ids = generated_bboxes[0, 1:] # [N, 4] LongTensor of IDs
+        # 4. Final Extraction and Mapping
+        final_cls_ids = generated_cls_ids[0, 1:] 
+        final_bbox_ids = generated_bboxes[0, 1:] # [N, 4] LongTensor of IDs
 
-    # Detokenize BBox IDs to float coordinates
-    final_bboxes_float = final_bbox_ids.float() / range_divisor # [N, 4] FloatTensor
+        # Detokenize BBox IDs to float coordinates
+        final_bboxes_float = final_bbox_ids.float() / range_divisor # [N, 4] FloatTensor
 
-    layout = []
-    for cls_id_tensor, bbox_float_tensor in zip(final_cls_ids, final_bboxes_float):
-        internal_cls_id = cls_id_tensor.item()
-        
-        if internal_cls_id < 0 or internal_cls_id >= model.num_element_classes:
-             continue 
-        
-        original_cls_id = internal_cls_id + 2
-        
-        cx, cy, w, h = bbox_float_tensor.tolist()
-        layout.append((original_cls_id, cx, cy, w, h))
+        layout = []
+        for cls_id_tensor, bbox_float_tensor in zip(final_cls_ids, final_bboxes_float):
+            internal_cls_id = cls_id_tensor.item()
+            
+            if internal_cls_id < 0 or internal_cls_id >= model.num_element_classes:
+                continue 
+            
+            original_cls_id = internal_cls_id + 2
+            
+            cx, cy, w, h = bbox_float_tensor.tolist()
+            layout.append((original_cls_id, cx, cy, w, h))
 
-    return layout
+        return layout

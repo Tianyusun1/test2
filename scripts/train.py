@@ -22,7 +22,8 @@ from collections import Counter
 import numpy as np 
 
 # --- 辅助函数：计算类别权重 (解决类别偏差问题) ---
-def compute_class_weights(dataset, num_classes: int):
+# **已修改: 包含 max_weight_ratio 参数和钳位逻辑**
+def compute_class_weights(dataset, num_classes: int, max_weight_ratio: float = 3.0):
     """
     计算数据集内所有布局元素的类别频率，并返回反向频率权重。
     权重公式: w_i = 1.0 / log(1.02 + p_i)
@@ -56,7 +57,10 @@ def compute_class_weights(dataset, num_classes: int):
             # 对于稀有/不存在的类别，赋予最高的权重
             weights[i] = 1.0 / np.log(1.02 + 1e-6) # 赋予最大权重
             
-    # 标准化权重 (可选，但通常有助于稳定训练)
+    # 权重钳位和标准化
+    avg_weight = weights.mean()
+    max_allowed_weight = avg_weight * max_weight_ratio
+    weights = torch.clamp(weights, max=max_allowed_weight)
     weights = weights / weights.sum() * num_classes
     
     return weights.float()
@@ -87,7 +91,7 @@ def main():
     print(f"Calculated Class Weights (Internal 0-8): {class_weights_tensor.tolist()}")
     # ---------------------------
 
-    # 3. Init model (传入 BBox 离散化参数, IoU 权重和类别权重)
+    # 3. Init model (传入所有损失权重，包括新增的 Reg, Cls, Count, Area)
     model = Poem2LayoutGenerator(
         bert_path=model_config['bert_path'],
         num_classes=num_element_classes, # 实际元素类别数 (9)
@@ -100,9 +104,13 @@ def main():
         decoder_layers=model_config['decoder_layers'],
         decoder_heads=model_config['decoder_heads'],
         dropout=model_config['dropout'],
+        # --- 传入所有损失权重 ---
         coord_loss_weight=model_config['coord_loss_weight'],
-        # --- 传入解决堆叠和类别偏差问题的关键参数 ---
         iou_loss_weight=model_config.get('iou_loss_weight', 1.0), 
+        reg_loss_weight=model_config.get('reg_loss_weight', 1.0),    # 传入 reg_loss_weight
+        cls_loss_weight=model_config.get('cls_loss_weight', 1.0),    # 传入 cls_loss_weight
+        count_loss_weight=model_config.get('count_loss_weight', 1.0),# 传入 count_loss_weight
+        area_loss_weight=model_config.get('area_loss_weight', 1.0),  # <<<< 新增: 传入 area_loss_weight
         class_weights=class_weights_tensor 
         # -----------------------------------------
     )
@@ -145,6 +153,16 @@ def main():
     example_idx_in_full_dataset = val_dataset.indices[0]
     example_poem = dataset.data[example_idx_in_full_dataset]
     
+    # **已修改: 打印固定推理样例的 KG 向量**
+    kg_vector_example = dataset.pkg.extract_visual_feature_vector(example_poem['poem'])
+    print("\n---------------------------------------------------")
+    print(f"Inference Example Poem: '{example_poem['poem']}'")
+    print(f"Inference Example GT Boxes: {example_poem['boxes']}")
+    print("-------------------- KG DEBUG ---------------------")
+    # 内部 ID 0-8 对应原始 ID 2-10
+    print(f"KG Vector (0:mountain(2), 1:water(3), ..., 8:animal(10)): {kg_vector_example.tolist()}")
+    print("---------------------------------------------------\n")
+
     # 5. Init trainer and start training
     # 将 test_loader 传递给 Trainer
     trainer = trainers.LayoutTrainer(model, train_loader, val_loader, config, tokenizer, example_poem, test_loader)

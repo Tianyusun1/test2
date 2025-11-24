@@ -38,6 +38,7 @@ class LayoutTrainer:
     """负责训练循环、优化器管理、日志记录和模型保存。"""
     # 构造函数新增 test_loader 参数
     def __init__(self, model, train_loader, val_loader, config, tokenizer, example_poem, test_loader):
+        super().__init__()
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -70,7 +71,10 @@ class LayoutTrainer:
         self.val_loss_history = []
         self.val_cls_history = []
         self.val_coord_history = []
+        self.val_reg_history = [] # **回归损失历史**
         self.val_iou_history = []
+        self.val_count_history = [] # **Count 损失历史**
+        self.val_area_history = [] # <<<< 新增: Area 损失历史
 
 
     def _run_epoch(self, data_loader, is_training: bool):
@@ -81,7 +85,10 @@ class LayoutTrainer:
         total_loss = 0.0
         total_cls_loss = 0.0
         total_coord_loss = 0.0
+        total_reg_loss = 0.0 
         total_iou_loss = 0.0
+        total_count_loss = 0.0 
+        total_area_loss = 0.0 # <<<< 新增: Area 损失
         
         context_manager = contextlib.nullcontext() if is_training else torch.no_grad()
         
@@ -94,25 +101,30 @@ class LayoutTrainer:
                 layout_mask = batch['layout_mask'].to(self.device)
                 
                 # --- FIX: 获取 KG 向量并移动到设备 ---
-                # dataset.py 中已经添加了 'kg_vector'
                 if 'kg_vector' in batch:
                     kg_vectors = batch['kg_vector'].to(self.device)
                 else:
-                    # Fallback (安全保障，假设 KG 维度为 9)
+                    # Fallback
                     batch_size = input_ids.size(0)
                     kg_vectors = torch.zeros((batch_size, 9), device=self.device)
                 # -----------------------------------
-
-                # 2. 前向传播 (FIXED: 传入 kg_vectors)
-                pred_cls, pred_coord = self.model(input_ids, attention_mask, layout_seq, kg_vectors)
                 
-                # 3. 计算损失
-                total_loss_item, cls_loss, coord_loss, iou_loss = self.model.get_loss(
-                    pred_cls, pred_coord, layout_seq, layout_mask
+                # 获取 num_boxes (真实数量)
+                num_boxes = batch['num_boxes'].to(self.device)
+
+                # 2. 前向传播
+                pred_cls, pred_bbox_ids, pred_coord_float, pred_count = self.model(
+                    input_ids, attention_mask, layout_seq, kg_vectors
+                )
+                
+                # 3. 计算损失 (FIXED: 接收 7 个返回值)
+                total_loss_item, cls_loss, coord_loss, reg_loss, iou_loss, count_loss, area_loss = self.model.get_loss( # <<<< 接收 area_loss
+                    pred_cls, pred_bbox_ids, pred_coord_float, pred_count, 
+                    layout_seq, layout_mask, num_boxes
                 )
                 
                 if is_training:
-                    # 4. 训练步骤: 零梯度、反向传播、优化器更新
+                    # 4. 训练步骤
                     self.optimizer.zero_grad()
                     total_loss_item.backward()
                     self.optimizer.step()
@@ -121,7 +133,10 @@ class LayoutTrainer:
                 total_loss += total_loss_item.item()
                 total_cls_loss += cls_loss.item()
                 total_coord_loss += coord_loss.item()
+                total_reg_loss += reg_loss.item()
                 total_iou_loss += iou_loss.item()
+                total_count_loss += count_loss.item()
+                total_area_loss += area_loss.item() # <<<< 累加 Area Loss
                 
                 # 5. 打印日志 (Training log)
                 if is_training and (step + 1) % self.log_steps == 0:
@@ -129,17 +144,23 @@ class LayoutTrainer:
                           f"Total: {total_loss_item.item():.4f} | "
                           f"Cls: {cls_loss.item():.4f} | "
                           f"Coord: {coord_loss.item():.4f} | "
-                          f"IoU: {iou_loss.item():.4f}")
+                          f"Reg: {reg_loss.item():.4f} | " 
+                          f"IoU: {iou_loss.item():.4f} | "
+                          f"Count: {count_loss.item():.4f} | "
+                          f"Area: {area_loss.item():.4f}") # <<<< 打印 Area Loss
         
         # 计算平均损失
         num_batches = len(data_loader)
         avg_loss = total_loss / num_batches
         avg_cls_loss = total_cls_loss / num_batches
         avg_coord_loss = total_coord_loss / num_batches
+        avg_reg_loss = total_reg_loss / num_batches 
         avg_iou_loss = total_iou_loss / num_batches
+        avg_count_loss = total_count_loss / num_batches 
+        avg_area_loss = total_area_loss / num_batches # <<<< 计算 Avg Area Loss
         
-        # 返回所有平均损失
-        return avg_loss, avg_cls_loss, avg_coord_loss, avg_iou_loss
+        # 返回 7 个平均损失
+        return avg_loss, avg_cls_loss, avg_coord_loss, avg_reg_loss, avg_iou_loss, avg_count_loss, avg_area_loss # <<<< 返回
 
 
     def validate(self):
@@ -147,7 +168,8 @@ class LayoutTrainer:
         start_time = time.time()
         print("\n--- Starting Validation ---")
         
-        avg_val_loss, avg_val_cls, avg_val_coord, avg_val_iou = self._run_epoch(self.val_loader, is_training=False)
+        # 接收 7 个平均损失
+        avg_val_loss, avg_val_cls, avg_val_coord, avg_val_reg, avg_val_iou, avg_val_count, avg_val_area = self._run_epoch(self.val_loader, is_training=False) # <<<< 接收 avg_val_area
         
         end_time = time.time()
         print(f"--- Validation Finished in {end_time - start_time:.2f}s ---")
@@ -156,13 +178,19 @@ class LayoutTrainer:
         self.val_loss_history.append(avg_val_loss)
         self.val_cls_history.append(avg_val_cls)
         self.val_coord_history.append(avg_val_coord)
+        self.val_reg_history.append(avg_val_reg) 
         self.val_iou_history.append(avg_val_iou)
+        self.val_count_history.append(avg_val_count)
+        self.val_area_history.append(avg_val_area) # <<<< 记录 Area Loss
         
         # 输出详细损失信息
         print(f"Validation Avg Loss: Total: {avg_val_loss:.4f} | "
               f"Cls: {avg_val_cls:.4f} | "
               f"Coord: {avg_val_coord:.4f} | "
-              f"IoU: {avg_val_iou:.4f}")
+              f"Reg: {avg_val_reg:.4f} | " 
+              f"IoU: {avg_val_iou:.4f} | "
+              f"Count: {avg_val_count:.4f} | "
+              f"Area: {avg_val_area:.4f}") # <<<< 打印
               
         return avg_val_loss
 
@@ -171,7 +199,8 @@ class LayoutTrainer:
         start_time = time.time()
         print("\n--- Starting Test Set Evaluation ---")
         
-        avg_test_loss, avg_test_cls, avg_test_coord, avg_test_iou = self._run_epoch(self.test_loader, is_training=False)
+        # 接收 7 个平均损失
+        avg_test_loss, avg_test_cls, avg_test_coord, avg_test_reg, avg_test_iou, avg_test_count, avg_test_area = self._run_epoch(self.test_loader, is_training=False) # <<<< 接收
         
         end_time = time.time()
         print(f"--- Test Finished in {end_time - start_time:.2f}s ---")
@@ -180,7 +209,10 @@ class LayoutTrainer:
         print(f"Test Avg Loss: Total: {avg_test_loss:.4f} | "
               f"Cls: {avg_test_cls:.4f} | "
               f"Coord: {avg_test_coord:.4f} | "
-              f"IoU: {avg_test_iou:.4f}")
+              f"Reg: {avg_test_reg:.4f} | " 
+              f"IoU: {avg_test_iou:.4f} | "
+              f"Count: {avg_test_count:.4f} | "
+              f"Area: {avg_test_area:.4f}") # <<<< 打印
               
         return avg_test_loss
 
@@ -213,13 +245,11 @@ class LayoutTrainer:
 
     def _plot_loss_history(self):
         """绘制并保存损失变化轨迹图"""
-        # (Matplotlib code remains the same as previously defined)
         if not self.train_loss_history:
             return
 
         epochs = range(1, len(self.train_loss_history) + 1)
         
-        # ... (rest of plot code omitted for brevity)
         plt.figure(figsize=(10, 6))
         
         # 1. 绘制总损失 (Train & Val)
@@ -230,7 +260,10 @@ class LayoutTrainer:
         if len(self.val_cls_history) > 1:
             plt.plot(epochs, self.val_cls_history, label='Val Cls Loss', linestyle='--')
             plt.plot(epochs, self.val_coord_history, label='Val Coord Loss', linestyle='--')
+            plt.plot(epochs, self.val_reg_history, label='Val Reg Loss', linestyle='--') 
             plt.plot(epochs, self.val_iou_history, label='Val IoU Loss', linestyle='--')
+            plt.plot(epochs, self.val_count_history, label='Val Count Loss', linestyle='--')
+            plt.plot(epochs, self.val_area_history, label='Val Area Loss', linestyle='--') # <<<< 绘制 Area Loss
 
         plt.title('Loss Trajectory Over Epochs')
         plt.xlabel('Epoch')
@@ -255,9 +288,10 @@ class LayoutTrainer:
             epoch_start_time = time.time()
             print(f"\n==================== Epoch {epoch+1}/{self.epochs} | Training ====================")
             
-            # 运行训练轮次 (并记录训练总损失)
-            avg_train_loss, _, _, _ = self._run_epoch(self.train_loader, is_training=True)
-            self.train_loss_history.append(avg_train_loss) # <--- 记录训练总损失
+            # 运行训练轮次
+            # **接收 7 个损失项，只取第一个 (总损失) 来记录**
+            avg_train_loss, _, _, _, _, _, _ = self._run_epoch(self.train_loader, is_training=True) # <<<< 忽略其他损失
+            self.train_loss_history.append(avg_train_loss)
             
             epoch_end_time = time.time()
             print(f"\nEpoch {epoch+1} finished. Avg Training Loss: {avg_train_loss:.4f} "
