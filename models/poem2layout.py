@@ -1,3 +1,5 @@
+# File: tianyusun1/test2/test2-16cf527f423e4c3eeef5db4d1111eb08bc4760b7/models/poem2layout.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,7 +9,8 @@ from .decoder import LayoutDecoder
 
 class Poem2LayoutGenerator(nn.Module):
     # num_classes: 实际的布局元素类别数 (例如：9)
-    def __init__(self, bert_path: str, num_classes: int, num_bbox_bins: int, bbox_embed_dim: int, hidden_size: int = 768, bb_size: int = 64, decoder_layers: int = 4, decoder_heads: int = 8, dropout: float = 0.1, coord_loss_weight: float = 1.0, iou_loss_weight: float = 0.1, class_weights: torch.Tensor = None):
+    # **修改: 增加 reg_loss_weight 参数**
+    def __init__(self, bert_path: str, num_classes: int, num_bbox_bins: int, bbox_embed_dim: int, hidden_size: int = 768, bb_size: int = 64, decoder_layers: int = 4, decoder_heads: int = 8, dropout: float = 0.1, coord_loss_weight: float = 1.0, iou_loss_weight: float = 0.1, reg_loss_weight: float = 1.0, class_weights: torch.Tensor = None):
         super(Poem2LayoutGenerator, self).__init__()
         
         self.num_element_classes = num_classes 
@@ -17,6 +20,7 @@ class Poem2LayoutGenerator(nn.Module):
         self.bb_size = bb_size
         self.coord_loss_weight = coord_loss_weight
         self.iou_loss_weight = iou_loss_weight
+        self.reg_loss_weight = reg_loss_weight # **新增: 存储回归损失权重**
         
         if class_weights is not None:
             self.register_buffer('class_weights', class_weights)
@@ -49,6 +53,7 @@ class Poem2LayoutGenerator(nn.Module):
             bbox_embed_dim=bbox_embed_dim
         )
         
+        # NOTE: decoder_layers, decoder_heads, dropout 会从 config 传入新值 (如 6, 8, 0.2)
         self.layout_decoder = LayoutDecoder(
             hidden_size=hidden_size,
             bb_size=bb_size,
@@ -62,13 +67,16 @@ class Poem2LayoutGenerator(nn.Module):
         # 分类头仍预测布局元素的数量 (9 类)
         self.cls_head = nn.Linear(decoder_output_size, self.num_element_classes)
         
-        # 4 个 BBox 坐标的分类头
+        # 4 个 BBox 坐标的分类头 (用于 L_coord)
         self.cx_head = nn.Linear(decoder_output_size, self.num_bbox_bins)
         self.cy_head = nn.Linear(decoder_output_size, self.num_bbox_bins)
         self.w_head = nn.Linear(decoder_output_size, self.num_bbox_bins)
         self.h_head = nn.Linear(decoder_output_size, self.num_bbox_bins)
+        
+        # **新增：4 个 BBox 坐标的连续回归头 (用于 L_reg)**
+        self.reg_head = nn.Linear(decoder_output_size, 4)
 
-    # --- Updated Forward to accept kg_vectors ---
+    # **修改: forward 返回 pred_cls, pred_bbox_ids (离散分类), pred_coord_float (连续回归)**
     def forward(self, input_ids, attention_mask, layout_seq, kg_vectors):
         # layout_seq: [B, S] 现包含整数 ID (类别 ID, cx_id, cy_id, w_id, h_id)
         batch_size, seq_len = layout_seq.shape
@@ -104,7 +112,7 @@ class Poem2LayoutGenerator(nn.Module):
         # Cls prediction
         pred_cls = self.cls_head(decoder_output) # [B, num_elements, num_element_classes]
         
-        # 4 BBox Token Predictions (Classification)
+        # 4 BBox Token Predictions (Classification for L_coord)
         pred_cx_id = self.cx_head(decoder_output) # [B, T, num_bbox_bins]
         pred_cy_id = self.cy_head(decoder_output)
         pred_w_id = self.w_head(decoder_output)
@@ -113,19 +121,41 @@ class Poem2LayoutGenerator(nn.Module):
         # 堆叠预测结果，用于损失计算
         # 形状: [B, T, 4, num_bbox_bins]
         pred_bbox_ids = torch.stack([pred_cx_id, pred_cy_id, pred_w_id, pred_h_id], dim=2) 
+        
+        # **新增：连续坐标预测 (用于 L_reg 和 L_iou)**
+        # 使用 sigmoid 激活函数将输出钳位到 [0, 1] 范围
+        pred_coord_float = torch.sigmoid(self.reg_head(decoder_output)) # [B, num_elements, 4]
 
-        return pred_cls, pred_bbox_ids
+        # **修改返回值为 3 个预测结果**
+        return pred_cls, pred_bbox_ids, pred_coord_float
 
     def generate_square_subsequent_mask(self, sz):
         mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
 
+    # **新增: 用于将目标 BBox Token ID 反量化为 float 坐标的辅助函数**
+    def _detokenize_target_ids(self, target_bbox_ids: torch.Tensor) -> torch.Tensor:
+        """
+        将目标的 BBox Token ID 转换回连续的浮点坐标。
+        目标 ID: [B, S, 4] (0-999)
+        """
+        num_bins = self.num_bbox_bins
+        range_divisor = num_bins - 1
+        
+        # 0.0 代表 PAD 或最小 bin 的起始值
+        detok_boxes = target_bbox_ids.float() / range_divisor
+        
+        return detok_boxes
+
+    # **修改: _detokenize_pred_ids 现在使用 pred_bbox_ids (logits) 而非 pred_coord_float**
     def _detokenize_pred_ids(self, pred_bbox_ids: torch.Tensor) -> torch.Tensor:
         """
         将预测的 BBox Token Logits 转换回连续的浮点坐标。
+        该函数仅用于 IoU 计算，但我们现在优先使用 pred_coord_float，所以此函数不再被 get_loss 直接使用，但保留以防万一。
         """
         # 1. 找到概率最高的 bin ID
+        # pred_bbox_ids 形状为 [B, S, 4, num_bins]
         pred_ids = pred_bbox_ids.argmax(dim=-1) # [B, S, 4]
         
         # 2. 反量化公式
@@ -139,7 +169,7 @@ class Poem2LayoutGenerator(nn.Module):
     def _compute_iou_loss(self, pred_boxes: torch.Tensor, valid_mask: torch.Tensor, iou_threshold: float = 0.5):
         """
         IoU 排斥损失计算。
-        NOTE: pred_boxes 必须是浮点值 (detokenized)。
+        NOTE: pred_boxes 必须是浮点值 (detokenized 或直接回归)。
         """
         B, S, _ = pred_boxes.shape
         
@@ -154,6 +184,7 @@ class Poem2LayoutGenerator(nn.Module):
         ], dim=-1).clamp(0., 1.) # [B, S, 4]
 
         # 2. Compute pairwise IoU
+        # ... (IoU 计算逻辑保持不变) ...
         area = (boxes[..., 2] - boxes[..., 0]) * (boxes[..., 3] - boxes[..., 1]) # [B, S]
         area_i = area.unsqueeze(2) # [B, S, 1]
         area_j = area.unsqueeze(1) # [B, 1, S]
@@ -195,10 +226,10 @@ class Poem2LayoutGenerator(nn.Module):
 
         return iou_loss
 
-    def get_loss(self, pred_cls, pred_bbox_ids, target_layout_seq, target_layout_mask):
+    # **修改: get_loss 接受 pred_coord_float，并计算 L_reg 和 L_iou**
+    def get_loss(self, pred_cls, pred_bbox_ids, pred_coord_float, target_layout_seq, target_layout_mask):
         """
-        Calculates the combined loss for class prediction and coordinate prediction,
-        NOW using Cross-Entropy for 4 BBox token predictions.
+        Calculates the combined Hybrid loss for class prediction, BBox token prediction, and BBox continuous regression.
         """
         batch_size, seq_len_decoded = target_layout_seq.shape 
         num_elements_decoded = seq_len_decoded // 5 
@@ -221,6 +252,7 @@ class Poem2LayoutGenerator(nn.Module):
             min_seq_len = min(pred_seq_len, target_seq_len)
             pred_cls = pred_cls[:, :min_seq_len, :] 
             pred_bbox_ids = pred_bbox_ids[:, :min_seq_len, :, :] # [B, min_S, 4, num_bins]
+            pred_coord_float = pred_coord_float[:, :min_seq_len, :] # **截断连续预测**
             target_cls_ids = target_cls_ids[:, :min_seq_len] 
             target_bbox_ids = target_bbox_ids[:, :min_seq_len, :] # [B, min_S, 4]
             cls_mask = cls_mask[:, :min_seq_len] 
@@ -230,11 +262,12 @@ class Poem2LayoutGenerator(nn.Module):
         # Map original IDs (2-10) to internal IDs (0-8)
         target_cls_ids_mapped = torch.clamp(target_cls_ids - 2, min=0, max=self.num_element_classes - 1)
         final_cls_mask = cls_mask & valid_cls_target_mask # [B, S]
+        final_cls_mask_flat = final_cls_mask.view(-1)
         
         # --- 1. Classification Loss (Cls ID - remains Cross-Entropy) ---
+        # ... (L_cls 计算逻辑保持不变) ...
         pred_cls_flat = pred_cls.view(-1, pred_cls.size(-1)) 
         target_cls_ids_flat = target_cls_ids_mapped.view(-1) 
-        final_cls_mask_flat = final_cls_mask.view(-1) 
         
         pred_cls_valid = pred_cls_flat[final_cls_mask_flat]
         target_cls_valid = target_cls_ids_flat[final_cls_mask_flat]
@@ -254,44 +287,47 @@ class Poem2LayoutGenerator(nn.Module):
         cls_loss = cls_loss_weighted.sum() / final_cls_mask_flat.sum().clamp(min=1) 
 
 
-        # --- 2. Coordinate Loss (BBox Token IDs - NOW Cross-Entropy) ---
-        # Reshape for Cross-Entropy: pred should be [N, C] and target [N]
-        
-        # FIX: Flatten only B, S, and 4 dimensions to get [B*S*4, num_bins]
+        # --- 2. Coordinate Loss (BBox Token IDs - L_coord Cross-Entropy) ---
+        # ... (L_coord 计算逻辑保持不变) ...
         pred_bbox_flat = pred_bbox_ids.flatten(0, 2) # [B*S*4, num_bins]
-
-        # target_bbox_ids: [B, S, 4] -> [B*S*4]
         target_bbox_flat = target_bbox_ids.flatten()
-        
-        # Expand mask for all 4 coordinates
-        # final_cls_mask: [B, S] -> [B, S, 4] -> [B*S*4]
         coord_mask_flat = final_cls_mask.unsqueeze(-1).expand(-1, -1, 4).flatten() 
         
         pred_bbox_valid = pred_bbox_flat[coord_mask_flat]
         target_bbox_valid = target_bbox_flat[coord_mask_flat]
         
-        # BBox token loss is standard CE.
         coord_loss = F.cross_entropy(
             pred_bbox_valid,
             target_bbox_valid,
             reduction='sum'
         )
-        # Normalize by the total number of valid BBox tokens (4 * num_valid_elements)
         num_valid_tokens = final_cls_mask_flat.sum().clamp(min=1) * 4 
         coord_loss = coord_loss / num_valid_tokens
+        
+        
+        # --- 3. Continuous Regression Loss (L_reg Smooth L1) ---
+        # 目标：将目标 BBox Token ID 反量化为 float 坐标
+        target_coord_float = self._detokenize_target_ids(target_bbox_ids) # [B, S, 4] float
+        
+        # 计算 Smooth L1 损失 (注意: target.detach() 是为了避免梯度流回数据)
+        reg_loss_per_coord = F.smooth_l1_loss(pred_coord_float, target_coord_float.detach(), reduction='none') # [B, S, 4]
+        
+        # 应用掩码并归一化
+        reg_loss = reg_loss_per_coord * final_cls_mask.unsqueeze(-1).float()
+        reg_loss = reg_loss.sum() / num_valid_tokens
+        
 
-        # --- 3. IoU Repulsion Loss (requires detokenization) ---
-        
-        # Get float coordinates by detokenizing the current prediction logits
-        pred_boxes_float = self._detokenize_pred_ids(pred_bbox_ids) # [B, S, 4] float
-        
+        # --- 4. IoU Repulsion Loss (L_iou) ---
+        # **关键修复: L_iou 现在使用连续回归头的预测结果 pred_coord_float**
         iou_loss = self._compute_iou_loss(
-            pred_boxes=pred_boxes_float, # Use detokenized floats
+            pred_boxes=pred_coord_float, 
             valid_mask=final_cls_mask,
             iou_threshold=0.5
         )
         
-        # --- 4. Combine Losses ---
-        total_loss = cls_loss + self.coord_loss_weight * coord_loss + self.iou_loss_weight * iou_loss
+        # --- 5. Combine Losses ---
+        # **修改: 整合 L_reg**
+        total_loss = cls_loss + self.coord_loss_weight * coord_loss + self.reg_loss_weight * reg_loss + self.iou_loss_weight * iou_loss
         
-        return total_loss, cls_loss, coord_loss, iou_loss
+        # **修改返回值为 5 个损失项**
+        return total_loss, cls_loss, coord_loss, reg_loss, iou_loss

@@ -1,27 +1,28 @@
-# Poem2Layout Configuration
+# File: tianyusun1/test2/test2-16cf527f423e4c3eeef5db4d1111eb08bc4760b7/configs/default.yaml
 
 model:
   # BERT encoder
   bert_path: "/home/610-sty/huggingface/bert-base-chinese"
   hidden_size: 768  # BERT hidden size
   # Layout decoder
-  bb_size: 64       # Layout embedding size (for cls + bbox). 必须等于 cls_embed_dim + 4 * bbox_embed_dim
-  decoder_layers: 4
+  bb_size: 64       
+  decoder_layers: 6       # **修改: 4 -> 6**
   decoder_heads: 8
-  dropout: 0.1
+  dropout: 0.2      # **修改: 0.1 -> 0.2**
   # Output
-  num_classes: 9    # 2~10 mapped to 0~8
+  num_classes: 9    
   
   # --- DISCRETE BBOX PARAMETERS (NEW) ---
-  num_bbox_bins: 1000       # BBox 坐标离散化为 1000 个 bins (范围 [0, 999])
-  cls_embed_dim: 16         # 类别 token (CLS/BOS/EOS) 的嵌入维度
-  bbox_embed_dim: 12        # 每个坐标 token (cx, cy, w, h) 的嵌入维度 (16 + 4*12 = 64)
-  iou_loss_weight: 1.0      # 提高 IoU 损失权重，以强制模型解决堆叠问题
+  num_bbox_bins: 1000       
+  cls_embed_dim: 16         
+  bbox_embed_dim: 12        
+  iou_loss_weight: 5.0      # **修改: 1.0 -> 5.0**
   # --------------------------------------
   
-  coord_loss_weight: 1.0 # 权重现在应用于 BBox 分类损失 (CrossEntropy)
+  coord_loss_weight: 1.0 # BBox Token 分类损失 (CrossEntropy)
+  reg_loss_weight: 1.0   # **新增: 连续回归损失权重**
   # Inference
-  max_elements: 30  # Max number of elements to generate
+  max_elements: 30 
   # Data paths
   xlsx_path: "/home/610-sty/Layout2Paint/dataset/6800poems.xlsx"
   images_dir: "/home/610-sty/Layout2Paint/dataset/6800"
@@ -32,12 +33,12 @@ model:
 training:
   batch_size: 16
   epochs: 100
-  learning_rate: 0.00005 # 采用较低学习率以增强离散模型的稳定性
+  learning_rate: 0.00005 
   warmup_steps: 1000
-  save_every: 10
+  save_every: 10 
   output_dir: "./outputs"
   log_steps: 10
 
 inference:
   max_output_length: 30
-  # beam_size: 1  # Only greedy for now
+  # beam_size: 1
