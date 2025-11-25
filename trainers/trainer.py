@@ -22,12 +22,13 @@ from collections import Counter
 import numpy as np 
 import time
 import contextlib 
-import torch.nn.utils # <<< NEW: Import for Gradient Clipping
+import torch.nn.utils 
+from torch.optim.lr_scheduler import LambdaLR 
 
 # --- NEW IMPORTS for Visualization/Inference/Plotting ---
 from inference.greedy_decode import greedy_decode_poem_layout 
 from data.visualize import draw_layout
-import matplotlib.pyplot as plt # <--- NEW IMPORT for plotting
+import matplotlib.pyplot as plt 
 # ---------------------------------------------
 
 
@@ -55,27 +56,71 @@ class LayoutTrainer:
         self.example_poem = example_poem
         
         # 训练和保存频率设置
+        self.lr = config['training']['learning_rate'] # Store base LR
         self.optimizer = optim.AdamW(
             model.parameters(), 
-            lr=config['training']['learning_rate']
+            lr=self.lr
         )
         self.epochs = config['training']['epochs']
         self.output_dir = config['training']['output_dir']
         self.log_steps = config['training'].get('log_steps', 10)
         self.save_every = config['training'].get('save_every', 10)
-        self.visualize_every = 1 # <--- NEW: Hardcoded for every epoch
-        self.plot_path = os.path.join(self.output_dir, "loss_trajectory.png") # Loss plot path
+        self.visualize_every = 1 
+        self.plot_path = os.path.join(self.output_dir, "loss_trajectory.png")
         os.makedirs(self.output_dir, exist_ok=True)
+
+        # <<< NEW: 学习率调度器初始化 >>>
+        self.warmup_steps = config['training'].get('warmup_steps', 0)
+        self.total_steps = len(train_loader) * self.epochs
+        self.global_step = 0
+        self.scheduler = self._get_lr_scheduler()
+        # <<< END NEW >>>
+
+        # <<< NEW: 最佳模型路径追踪 >>>
+        self.current_best_model_path = None
         
-        # 损失历史追踪 (NEW)
+        # 损失历史追踪
         self.train_loss_history = []
         self.val_loss_history = []
         self.val_cls_history = []
         self.val_coord_history = []
-        self.val_reg_history = [] # **回归损失历史**
+        self.val_reg_history = [] 
         self.val_iou_history = []
-        self.val_count_history = [] # **Count 损失历史**
-        self.val_area_history = [] # <<<< 新增: Area 损失历史
+        self.val_count_history = [] 
+        self.val_area_history = [] 
+
+    # <<< MODIFIED METHOD: 学习率调度函数 (Warmup + Hold + Decay) >>>
+    def _get_lr_scheduler(self):
+        """定义带线性 Warmup、5 Epoch Hold 和后续衰减的学习率调度器。"""
+        
+        # 设定保持最大学习率的 Epoch 数
+        N_HOLD_EPOCHS = 5
+        steps_per_epoch = len(self.train_loader)
+        hold_steps = steps_per_epoch * N_HOLD_EPOCHS
+        
+        def lr_lambda(current_step):
+            if current_step < self.warmup_steps:
+                # 阶段 1: 线性 Warmup
+                return float(current_step) / float(max(1, self.warmup_steps))
+            
+            elif current_step < hold_steps:
+                 # 阶段 2: 保持最大学习率 (N_HOLD_EPOCHS 个 Epoch)
+                return 1.0 
+
+            else:
+                # 阶段 3: 线性衰减
+                decay_start_step = hold_steps
+                decay_steps = self.total_steps - decay_start_step
+                
+                if decay_steps > 0:
+                    # 衰减因子：从 1.0 线性衰减到 0.0
+                    relative_step = current_step - decay_start_step
+                    return max(0.0, 1.0 - (relative_step / decay_steps))
+                
+                return 0.0
+            
+        return LambdaLR(self.optimizer, lr_lambda)
+    # <<< END MODIFIED METHOD >>>
 
 
     def _run_epoch(self, data_loader, is_training: bool):
@@ -89,7 +134,7 @@ class LayoutTrainer:
         total_reg_loss = 0.0 
         total_iou_loss = 0.0
         total_count_loss = 0.0 
-        total_area_loss = 0.0 # <<<< 新增: Area 损失
+        total_area_loss = 0.0
         
         context_manager = contextlib.nullcontext() if is_training else torch.no_grad()
         
@@ -105,7 +150,6 @@ class LayoutTrainer:
                 if 'kg_vector' in batch:
                     kg_vectors = batch['kg_vector'].to(self.device)
                 else:
-                    # Fallback
                     batch_size = input_ids.size(0)
                     kg_vectors = torch.zeros((batch_size, 9), device=self.device)
                 
@@ -118,13 +162,12 @@ class LayoutTrainer:
                 num_boxes = batch['num_boxes'].to(self.device)
 
                 # 2. 前向传播
-                # [MODIFIED] Pass kg_spatial_matrix to model
                 pred_cls, pred_bbox_ids, pred_coord_float, pred_count = self.model(
                     input_ids, attention_mask, layout_seq, kg_vectors, kg_spatial_matrix=kg_spatial_matrix
                 )
                 
-                # 3. 计算损失 (FIXED: 接收 7 个返回值)
-                total_loss_item, cls_loss, coord_loss, reg_loss, iou_loss, count_loss, area_loss = self.model.get_loss( # <<<< 接收 area_loss
+                # 3. 计算损失 (接收 7 个返回值)
+                total_loss_item, cls_loss, coord_loss, reg_loss, iou_loss, count_loss, area_loss = self.model.get_loss( 
                     pred_cls, pred_bbox_ids, pred_coord_float, pred_count, 
                     layout_seq, layout_mask, num_boxes
                 )
@@ -134,10 +177,15 @@ class LayoutTrainer:
                     self.optimizer.zero_grad()
                     total_loss_item.backward()
                     
-                    # [NEW] 梯度裁剪：防止梯度爆炸导致的训练不稳定
+                    # 梯度裁剪
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     
                     self.optimizer.step()
+                    
+                    # <<< NEW: 更新学习率 >>>
+                    self.scheduler.step()
+                    self.global_step += 1
+                    # <<< END NEW >>>
                 
                 # 累加所有损失
                 total_loss += total_loss_item.item()
@@ -146,18 +194,20 @@ class LayoutTrainer:
                 total_reg_loss += reg_loss.item()
                 total_iou_loss += iou_loss.item()
                 total_count_loss += count_loss.item()
-                total_area_loss += area_loss.item() # <<<< 累加 Area Loss
+                total_area_loss += area_loss.item()
                 
                 # 5. 打印日志 (Training log)
                 if is_training and (step + 1) % self.log_steps == 0:
+                    current_lr = self.optimizer.param_groups[0]['lr'] # 获取当前学习率
                     print(f"Epoch [TRAIN] Step {step+1}/{len(data_loader)} | "
+                          f"LR: {current_lr:.6e} | " # 打印当前学习率
                           f"Total: {total_loss_item.item():.4f} | "
                           f"Cls: {cls_loss.item():.4f} | "
                           f"Coord: {coord_loss.item():.4f} | "
                           f"Reg: {reg_loss.item():.4f} | " 
                           f"IoU: {iou_loss.item():.4f} | "
                           f"Count: {count_loss.item():.4f} | "
-                          f"Area: {area_loss.item():.4f}") # <<<< 打印 Area Loss
+                          f"Area: {area_loss.item():.4f}") 
         
         # 计算平均损失
         num_batches = len(data_loader)
@@ -167,10 +217,10 @@ class LayoutTrainer:
         avg_reg_loss = total_reg_loss / num_batches 
         avg_iou_loss = total_iou_loss / num_batches
         avg_count_loss = total_count_loss / num_batches 
-        avg_area_loss = total_area_loss / num_batches # <<<< 计算 Avg Area Loss
+        avg_area_loss = total_area_loss / num_batches 
         
         # 返回 7 个平均损失
-        return avg_loss, avg_cls_loss, avg_coord_loss, avg_reg_loss, avg_iou_loss, avg_count_loss, avg_area_loss # <<<< 返回
+        return avg_loss, avg_cls_loss, avg_coord_loss, avg_reg_loss, avg_iou_loss, avg_count_loss, avg_area_loss
 
 
     def validate(self):
@@ -179,7 +229,7 @@ class LayoutTrainer:
         print("\n--- Starting Validation ---")
         
         # 接收 7 个平均损失
-        avg_val_loss, avg_val_cls, avg_val_coord, avg_val_reg, avg_val_iou, avg_val_count, avg_val_area = self._run_epoch(self.val_loader, is_training=False) # <<<< 接收 avg_val_area
+        avg_val_loss, avg_val_cls, avg_val_coord, avg_val_reg, avg_val_iou, avg_val_count, avg_val_area = self._run_epoch(self.val_loader, is_training=False) 
         
         end_time = time.time()
         print(f"--- Validation Finished in {end_time - start_time:.2f}s ---")
@@ -191,7 +241,7 @@ class LayoutTrainer:
         self.val_reg_history.append(avg_val_reg) 
         self.val_iou_history.append(avg_val_iou)
         self.val_count_history.append(avg_val_count)
-        self.val_area_history.append(avg_val_area) # <<<< 记录 Area Loss
+        self.val_area_history.append(avg_val_area) 
         
         # 输出详细损失信息
         print(f"Validation Avg Loss: Total: {avg_val_loss:.4f} | "
@@ -200,7 +250,7 @@ class LayoutTrainer:
               f"Reg: {avg_val_reg:.4f} | " 
               f"IoU: {avg_val_iou:.4f} | "
               f"Count: {avg_val_count:.4f} | "
-              f"Area: {avg_val_area:.4f}") # <<<< 打印
+              f"Area: {avg_val_area:.4f}") 
               
         return avg_val_loss
 
@@ -210,7 +260,7 @@ class LayoutTrainer:
         print("\n--- Starting Test Set Evaluation ---")
         
         # 接收 7 个平均损失
-        avg_test_loss, avg_test_cls, avg_test_coord, avg_test_reg, avg_test_iou, avg_test_count, avg_test_area = self._run_epoch(self.test_loader, is_training=False) # <<<< 接收
+        avg_test_loss, avg_test_cls, avg_test_coord, avg_test_reg, avg_test_iou, avg_test_count, avg_test_area = self._run_epoch(self.test_loader, is_training=False) 
         
         end_time = time.time()
         print(f"--- Test Finished in {end_time - start_time:.2f}s ---")
@@ -222,7 +272,7 @@ class LayoutTrainer:
               f"Reg: {avg_test_reg:.4f} | " 
               f"IoU: {avg_test_iou:.4f} | "
               f"Count: {avg_test_count:.4f} | "
-              f"Area: {avg_test_area:.4f}") # <<<< 打印
+              f"Area: {avg_test_area:.4f}") 
               
         return avg_test_loss
 
@@ -273,7 +323,7 @@ class LayoutTrainer:
             plt.plot(epochs, self.val_reg_history, label='Val Reg Loss', linestyle='--') 
             plt.plot(epochs, self.val_iou_history, label='Val IoU Loss', linestyle='--')
             plt.plot(epochs, self.val_count_history, label='Val Count Loss', linestyle='--')
-            plt.plot(epochs, self.val_area_history, label='Val Area Loss', linestyle='--') # <<<< 绘制 Area Loss
+            plt.plot(epochs, self.val_area_history, label='Val Area Loss', linestyle='--') 
 
         plt.title('Loss Trajectory Over Epochs')
         plt.xlabel('Epoch')
@@ -294,13 +344,15 @@ class LayoutTrainer:
         print("--- Starting Full Training ---")
         best_val_loss = float('inf')
         
+        # 打印总步数和初始学习率，方便追踪
+        print(f"Total training steps: {self.total_steps}, Warmup steps: {self.warmup_steps}, Base LR: {self.lr:.6e}")
+        
         for epoch in range(self.epochs):
             epoch_start_time = time.time()
             print(f"\n==================== Epoch {epoch+1}/{self.epochs} | Training ====================")
             
             # 运行训练轮次
-            # **接收 7 个损失项，只取第一个 (总损失) 来记录**
-            avg_train_loss, _, _, _, _, _, _ = self._run_epoch(self.train_loader, is_training=True) # <<<< 忽略其他损失
+            avg_train_loss, _, _, _, _, _, _ = self._run_epoch(self.train_loader, is_training=True) 
             self.train_loss_history.append(avg_train_loss)
             
             epoch_end_time = time.time()
@@ -317,23 +369,43 @@ class LayoutTrainer:
             if (epoch + 1) % self.visualize_every == 0:
                 self._run_inference_example(epoch)
 
-            # Step 3: 检查点保存和测试集评估
+            # Step 3: 定期检查点保存
             if (epoch + 1) % self.save_every == 0:
                  # 运行测试集评估
                  self.test()
                  
-                 # 保存带 Epoch 编号的检查点
+                 # 保存带 Epoch 编号的检查点 (这部分仍然有意义，用于历史和恢复)
                  model_name = f"model_epoch_{epoch+1}_val_loss_{avg_val_loss:.4f}.pth"
                  checkpoint_path = os.path.join(self.output_dir, model_name)
                  torch.save({'model_state_dict': self.model.state_dict(), 'epoch': epoch+1, 'val_loss': avg_val_loss}, checkpoint_path)
                  print(f"-> Checkpoint saved to {checkpoint_path}")
 
-            # Step 4: 最佳模型保存
+            # Step 4: 最佳模型保存 (仅保留当前最佳，删除旧文件) <<< MODIFIED LOGIC
             if avg_val_loss < best_val_loss:
+                print("-> New best validation loss achieved. Replacing previous best model.")
+                
+                # 1. 记录旧的最佳路径
+                prev_best_path = self.current_best_model_path
+                
+                # 2. 更新最佳损失和新路径
                 best_val_loss = avg_val_loss
-                model_name = f"model_best_val_loss_{avg_val_loss:.4f}.pth"
-                checkpoint_path = os.path.join(self.output_dir, model_name)
-                torch.save({'model_state_dict': self.model.state_dict(), 'epoch': epoch+1, 'val_loss': avg_val_loss}, checkpoint_path)
-                print(f"-> New best model saved to {checkpoint_path}")
+                # 使用包含损失的新名称，但我们只会保留最新的这个
+                model_name = f"model_best_val_loss_{avg_val_loss:.4f}.pth" 
+                new_best_path = os.path.join(self.output_dir, model_name)
+                
+                # 3. 保存新模型
+                torch.save({'model_state_dict': self.model.state_dict(), 'epoch': epoch+1, 'val_loss': avg_val_loss}, new_best_path)
+                print(f"-> New best model saved to {new_best_path}")
+
+                # 4. 删除旧的最佳模型（如果存在且不是新保存的模型）
+                if prev_best_path and os.path.exists(prev_best_path) and prev_best_path != new_best_path:
+                    try:
+                        os.remove(prev_best_path)
+                        print(f"-> Deleted previous best model: {prev_best_path}")
+                    except OSError as e:
+                        print(f"[Warning] Could not delete previous best model {prev_best_path}: {e}")
+                
+                # 5. 更新当前最佳路径
+                self.current_best_model_path = new_best_path
                  
         print("--- Training Completed ---")

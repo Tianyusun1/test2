@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-cc8b0f0a73b00d0c96a3d267fe297e6b8a7891be/models/poem2layout.py
+# File: tianyusun1/test2/test2-2.0/models/poem2layout.py (MODIFIED)
 
 import torch
 import torch.nn as nn
@@ -320,13 +320,30 @@ class Poem2LayoutGenerator(nn.Module):
             iou_threshold=0.5
         )
 
-        # 5. Area Loss
-        pred_area = pred_coord_float[..., 2] * pred_coord_float[..., 3] 
-        area_loss_per_element = torch.abs(pred_area) 
+        # 5. Area Loss <<< MODIFIED >>>
+        
+        # NOTE: target_coord_float is already calculated in Section 3 (Reg Loss)
+
+        # Calculate target area (w * h)
+        target_w = target_coord_float[..., 2]
+        target_h = target_coord_float[..., 3]
+        target_area = target_w * target_h
+        
+        # Calculate predicted area (w * h)
+        pred_w = pred_coord_float[..., 2]
+        pred_h = pred_coord_float[..., 3]
+        pred_area = pred_w * pred_h 
+
+        # Use Smooth L1 to penalize the difference between predicted and target area
+        # Detach target_area as it comes from the discrete path
+        area_loss_per_element = F.smooth_l1_loss(pred_area, target_area.detach(), reduction='none') 
+
+        # Reuse existing masks for valid elements
         area_loss_mask = (cls_mask & valid_coord_target_mask).float() 
         num_valid_elements = area_loss_mask.sum().clamp(min=1)
+        
         area_loss = area_loss_per_element * area_loss_mask
-        area_loss = area_loss.sum() / num_valid_elements 
+        area_loss = area_loss.sum() / num_valid_elements
         
         # 6. Count Loss
         target_count = target_num_boxes.float().unsqueeze(1) 
@@ -338,6 +355,6 @@ class Poem2LayoutGenerator(nn.Module):
                      (self.reg_loss_weight * reg_loss) + \
                      (self.iou_loss_weight * iou_loss) + \
                      (self.count_loss_weight * count_loss) + \
-                     (self.area_loss_weight * area_loss) 
+                     (self.area_loss_weight * area_loss) # Area Loss is now correctly included
         
         return total_loss, cls_loss, coord_loss, reg_loss, iou_loss, count_loss, area_loss

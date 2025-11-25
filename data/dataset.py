@@ -6,6 +6,7 @@ from pathlib import Path
 from torch.utils.data import Dataset
 from transformers import BertTokenizer
 from typing import List, Tuple, Dict, Optional
+import numpy as np # <<< NEW: 导入 numpy 用于几何增强
 
 # --- NEW: 从同级目录的 utils.py 导入 BBoxTokenizer ---
 from .utils import BBoxTokenizer 
@@ -136,22 +137,38 @@ class PoegraphLayoutDataset(Dataset):
         )
 
         # --- NEW: 提取 KG 视觉特征向量 ---
-        # 这个向量长度为 9，对应 9 个视觉类别
         kg_vector = self.pkg.extract_visual_feature_vector(poem)
         
         # --- [NEW] 提取 KG 空间关系矩阵 ---
-        # 矩阵形状: [9, 9]，包含关系 ID (0-6)
         kg_spatial_matrix = self.pkg.extract_spatial_matrix(poem)
         # -------------------------------
 
         # 2. 布局序列：展平为一维 list (核心修改)
         layout_seq_ids = []
+        
+        # ===============================================
+        # [NEW] 几何增强 (Geometric Augmentation)
+        # 仅在训练阶段应用 (假设 DataLoader 会在训练时调用此增强)
+        # ===============================================
+        # 50% 的概率应用增强
+        apply_aug = np.random.rand() < 0.5 
+        
         for cls_id_float, cx, cy, w, h in boxes:
+            if apply_aug:
+                # 随机噪声范围: [-0.01, 0.01] (对应 1% 的扰动)
+                noise_magnitude = 0.01 
+                noise = np.random.uniform(-noise_magnitude, noise_magnitude, size=4)
+                
+                # 1. 坐标 (cx, cy) 扰动并钳位到 [0.0, 1.0]
+                cx = np.clip(cx + noise[0], 0.0, 1.0).item()
+                cy = np.clip(cy + noise[1], 0.0, 1.0).item()
+                
+                # 2. 尺寸 (w, h) 扰动并钳位到 [0.01, 1.0] (确保尺寸不为零或负)
+                w = np.clip(w + noise[2], 0.01, 1.0).item()
+                h = np.clip(h + noise[3], 0.01, 1.0).item()
             
-            # --- NEW: BBox 离散化 ---
-            # 类别 ID 仍使用 float (2.0-10.0)，在 collate_fn 中转为 LongTensor
-            
-            # 将 4 个连续坐标转换为整数 ID (0 - num_bins-1)
+            # --- BBox 离散化 ---
+            # 将 4 个连续坐标 (可能被增强的) 转换为整数 ID (0 - num_bins-1)
             cx_id = self.bbox_tokenizer.tokenize(cx)
             cy_id = self.bbox_tokenizer.tokenize(cy)
             w_id = self.bbox_tokenizer.tokenize(w)
@@ -171,7 +188,7 @@ class PoegraphLayoutDataset(Dataset):
         }
 
 # ========================
-# Collate Function for DataLoader - 必须修改以处理整数序列和 KG 向量
+# Collate Function for DataLoader - 保持不变
 # ========================
 def layout_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     """

@@ -8,7 +8,7 @@ model:
   bb_size: 64       
   decoder_layers: 6       
   decoder_heads: 8
-  dropout: 0.2      
+  dropout: 0.3      # 保持不变
   # Output
   num_classes: 9    
   
@@ -16,14 +16,14 @@ model:
   num_bbox_bins: 1000       
   cls_embed_dim: 16         
   bbox_embed_dim: 12        
-  iou_loss_weight: 25.0     # <<< MODIFIED: 从 10.0 增加到 25.0，强力排斥重叠
+  iou_loss_weight: 35.0     # 保持不变，强力排斥重叠
   # --------------------------------------
   
-  coord_loss_weight: 5.0     # BBox Token 分类损失
-  reg_loss_weight: 20.0       # 连续回归损失权重
-  cls_loss_weight: 10.0     # 分类损失权重
-  count_loss_weight: 20.0   # 数量预测损失权重
-  area_loss_weight: 0.0    # 面积惩罚权重 (禁用)
+  coord_loss_weight: 10.0    # 保持不变
+  reg_loss_weight: 30.0       # <<< MODIFIED: 从 20.0 提高到 30.0，进一步强调几何精确度
+  cls_loss_weight: 10.0     # 保持不变
+  count_loss_weight: 20.0   # 保持不变
+  area_loss_weight: 10.0    # <<< MODIFIED: 从 0.0 启用并设置为 10.0，惩罚预测面积与真实面积的差异
   # Inference
   max_elements: 30 
   # Data paths
@@ -35,10 +35,10 @@ model:
 
 training:
   batch_size: 16
-  epochs: 100
-  learning_rate: 0.00005 
+  epochs: 400
+  learning_rate: 0.0001 
   warmup_steps: 1000
-  save_every: 10 
+  save_every: 50 
   output_dir: "./outputs"
   log_steps: 10
 

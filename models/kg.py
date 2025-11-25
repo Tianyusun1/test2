@@ -397,7 +397,7 @@ class PoetryKnowledgeGraph:
         
         Returns:
             vector: 长度为 9 的 Tensor (对应内部 index 0-8, 即类别 2-10)
-                    1.0 表示该元素在诗中被明确提及或强烈暗示。
+                    1.0 表示该元素在诗中被明确提及，0.5 表示被场景暗示。
         """
         # 初始化 9 维向量 (对应 2-10)
         # Index 0 -> Class 2 (mountain), Index 1 -> Class 3 (water), ...
@@ -419,9 +419,9 @@ class PoetryKnowledgeGraph:
                 for cls_id in implied_ids:
                     idx = cls_id - 2
                     if 0 <= idx < self.num_classes:
-                        # 场景暗示的权重可以设为 1.0 (强约束) 或 0.5 (弱约束)
-                        # 这里设为 1.0，表示只要场景出现，相关元素就"应该"出现
-                        visual_vector[idx] = 1.0
+                        # MODIFIED: 使用 0.5 作为场景暗示的弱约束，前提是该位置目前不是 1.0 (即未被明确提及)
+                        if visual_vector[idx] < 1.0:
+                            visual_vector[idx] = 0.5 # <--- 场景暗示权重降为 0.5
                         
         return visual_vector
 
