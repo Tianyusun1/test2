@@ -76,7 +76,8 @@ class ContMultiHeadedAttention(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, k: Tensor, v: Tensor, q: Tensor, mask: Tensor = None):
+    # [MODIFIED] Added spatial_bias parameter
+    def forward(self, k: Tensor, v: Tensor, q: Tensor, mask: Tensor = None, spatial_bias: Tensor = None):
         batch_size = k.size(0) # Assume batch_size is consistent across k, v, q
         num_heads = self.num_heads
         head_size_k = self.head_size_k
@@ -94,6 +95,12 @@ class ContMultiHeadedAttention(nn.Module):
         q = q / (head_size_k ** 0.5) # Scale
         # Scores: [B, H, L_q, Dh_k] x [B, H, Dh_k, L_k] -> [B, H, L_q, L_k]
         scores = torch.matmul(q, k.transpose(2, 3))
+        
+        # [NEW] Inject spatial bias
+        # spatial_bias shape expected: [B, H, L_q, L_k] or broadcastable
+        if spatial_bias is not None:
+            scores = scores + spatial_bias
+
         if mask is not None:
             # Handle different mask types (bool, int, float)
             if mask.dim() == 2: # [L_q, L_k]
@@ -192,14 +199,19 @@ class PoemLayoutDecoderLayer(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, layout_x: Tensor, text_x: Tensor, text_memory: Tensor, src_mask: Tensor, trg_mask: Tensor):
+    # [MODIFIED] Added spatial_bias parameter
+    def forward(self, layout_x: Tensor, text_x: Tensor, text_memory: Tensor, src_mask: Tensor, trg_mask: Tensor, spatial_bias: Tensor = None):
         # layout_x: [B, T, bb_size]
         # text_x: [B, T, hidden_size]
         # text_memory: [B, L_text, hidden_size]
         
         # 1. Layout self-attention: Q=K=V=layout_norm1
         layout_norm1 = self.layout_norm1(layout_x)
-        layout_self_out = self.layout_self_attn(layout_norm1, layout_norm1, layout_norm1, mask=trg_mask)
+        
+        # [MODIFIED] Pass spatial_bias to layout self-attention
+        # This allows the model to attend to other layout elements based on their spatial relationship
+        layout_self_out = self.layout_self_attn(layout_norm1, layout_norm1, layout_norm1, mask=trg_mask, spatial_bias=spatial_bias)
+        
         layout_self_out = self.dropout(layout_self_out) + layout_x # Residual: [B, T, bb_size]
 
         # 2. Layout attends to Text: Q=layout_norm2, K=V=text_memory

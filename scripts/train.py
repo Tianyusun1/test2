@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-cc8b0f0a73b00d0c96a3d267fe297e6b8a7891be/scripts/train.py
+# File: scripts/train.py
 
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
@@ -23,13 +23,10 @@ from collections import Counter
 import numpy as np 
 
 # --- 辅助函数：计算类别权重 (解决类别偏差问题) ---
-# **已修改: 确保返回 10 个权重 (1 个 EOS + 9 个元素)**
 def compute_class_weights(dataset, num_classes: int, max_weight_ratio: float = 3.0):
     """
     计算数据集内所有布局元素的类别频率，并返回反向频率权重。
-    
-    MODIFIED: 返回 (num_classes + 1) 个权重，其中索引 0 对应 EOS。
-    num_classes: 9 (元素的数量)
+    返回 (num_classes + 1) 个权重，其中索引 0 对应 EOS。
     """
     element_class_counts = Counter()
     
@@ -108,7 +105,6 @@ def main():
     num_element_classes = model_config['num_classes'] # 9
     class_weights_tensor = compute_class_weights(dataset, num_element_classes)
     
-    # **修改 2.1: 修正打印输出，反映新的 10 类权重**
     print(f"Calculated Class Weights (Internal 0:EOS, 1-9:Elements 2-10): {class_weights_tensor.tolist()}")
     # ---------------------------
 
@@ -116,7 +112,7 @@ def main():
     model = Poem2LayoutGenerator(
         bert_path=model_config['bert_path'],
         num_classes=num_element_classes, # 实际元素类别数 (9)
-        # --- NEW: BBox Discrete Parameters ---
+        # --- BBox Discrete Parameters ---
         num_bbox_bins=model_config['num_bbox_bins'],
         bbox_embed_dim=model_config['bbox_embed_dim'],
         # --------------------------------------
@@ -131,7 +127,7 @@ def main():
         reg_loss_weight=model_config.get('reg_loss_weight', 1.0),    # 传入 reg_loss_weight
         cls_loss_weight=model_config.get('cls_loss_weight', 1.0),    # 传入 cls_loss_weight
         count_loss_weight=model_config.get('count_loss_weight', 1.0),# 传入 count_loss_weight
-        area_loss_weight=model_config.get('area_loss_weight', 1.0),  # <<<< 新增: 传入 area_loss_weight
+        area_loss_weight=model_config.get('area_loss_weight', 1.0),  # 传入 area_loss_weight
         class_weights=class_weights_tensor 
         # -----------------------------------------
     )
@@ -174,14 +170,20 @@ def main():
     example_idx_in_full_dataset = val_dataset.indices[0]
     example_poem = dataset.data[example_idx_in_full_dataset]
     
-    # **已修改: 打印固定推理样例的 KG 向量**
-    kg_vector_example = dataset.pkg.extract_visual_feature_vector(example_poem['poem'])
+    # **打印固定推理样例的 KG 向量和空间矩阵**
     print("\n---------------------------------------------------")
     print(f"Inference Example Poem: '{example_poem['poem']}'")
     print(f"Inference Example GT Boxes: {example_poem['boxes']}")
     print("-------------------- KG DEBUG ---------------------")
-    # 内部 ID 0-8 对应原始 ID 2-10
+    
+    # 1. 视觉向量
+    kg_vector_example = dataset.pkg.extract_visual_feature_vector(example_poem['poem'])
     print(f"KG Vector (0:mountain(2), 1:water(3), ..., 8:animal(10)): {kg_vector_example.tolist()}")
+    
+    # 2. [NEW] 空间矩阵
+    kg_spatial_matrix_example = dataset.pkg.extract_spatial_matrix(example_poem['poem'])
+    print("Spatial Matrix (9x9):")
+    print(kg_spatial_matrix_example)
     print("---------------------------------------------------\n")
 
     # 5. Init trainer and start training

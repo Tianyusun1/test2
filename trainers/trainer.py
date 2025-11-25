@@ -22,6 +22,7 @@ from collections import Counter
 import numpy as np 
 import time
 import contextlib 
+import torch.nn.utils # <<< NEW: Import for Gradient Clipping
 
 # --- NEW IMPORTS for Visualization/Inference/Plotting ---
 from inference.greedy_decode import greedy_decode_poem_layout 
@@ -100,21 +101,26 @@ class LayoutTrainer:
                 layout_seq = batch['layout_seq'].to(self.device)
                 layout_mask = batch['layout_mask'].to(self.device)
                 
-                # --- FIX: 获取 KG 向量并移动到设备 ---
+                # 获取 KG 向量并移动到设备
                 if 'kg_vector' in batch:
                     kg_vectors = batch['kg_vector'].to(self.device)
                 else:
                     # Fallback
                     batch_size = input_ids.size(0)
                     kg_vectors = torch.zeros((batch_size, 9), device=self.device)
-                # -----------------------------------
+                
+                # [NEW] 获取 KG 空间矩阵并移动到设备
+                kg_spatial_matrix = None
+                if 'kg_spatial_matrix' in batch:
+                    kg_spatial_matrix = batch['kg_spatial_matrix'].to(self.device)
                 
                 # 获取 num_boxes (真实数量)
                 num_boxes = batch['num_boxes'].to(self.device)
 
                 # 2. 前向传播
+                # [MODIFIED] Pass kg_spatial_matrix to model
                 pred_cls, pred_bbox_ids, pred_coord_float, pred_count = self.model(
-                    input_ids, attention_mask, layout_seq, kg_vectors
+                    input_ids, attention_mask, layout_seq, kg_vectors, kg_spatial_matrix=kg_spatial_matrix
                 )
                 
                 # 3. 计算损失 (FIXED: 接收 7 个返回值)
@@ -127,6 +133,10 @@ class LayoutTrainer:
                     # 4. 训练步骤
                     self.optimizer.zero_grad()
                     total_loss_item.backward()
+                    
+                    # [NEW] 梯度裁剪：防止梯度爆炸导致的训练不稳定
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    
                     self.optimizer.step()
                 
                 # 累加所有损失

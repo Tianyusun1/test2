@@ -136,13 +136,15 @@ class PoegraphLayoutDataset(Dataset):
         )
 
         # --- NEW: 提取 KG 视觉特征向量 ---
-        # 这个向量长度为 9，对应 9 个视觉类别，表示它们在诗中是否被提及或暗示
+        # 这个向量长度为 9，对应 9 个视觉类别
         kg_vector = self.pkg.extract_visual_feature_vector(poem)
+        
+        # --- [NEW] 提取 KG 空间关系矩阵 ---
+        # 矩阵形状: [9, 9]，包含关系 ID (0-6)
+        kg_spatial_matrix = self.pkg.extract_spatial_matrix(poem)
         # -------------------------------
 
         # 2. 布局序列：展平为一维 list (核心修改)
-        # layout_seq 现在是一个包含整数 ID 的列表：
-        # [cls_id, cx_id, cy_id, w_id, h_id, cls_id, cx_id, ...]
         layout_seq_ids = []
         for cls_id_float, cx, cy, w, h in boxes:
             
@@ -164,7 +166,8 @@ class PoegraphLayoutDataset(Dataset):
             # 传递包含 ID 的 float 列表 (在 collate_fn 中转为 LongTensor)
             'layout_seq': layout_seq_ids, 
             'num_boxes': len(boxes),
-            'kg_vector': kg_vector # <--- NEW: 返回 KG 向量
+            'kg_vector': kg_vector, # <--- NEW: 返回 KG 向量
+            'kg_spatial_matrix': kg_spatial_matrix # <--- NEW: 返回空间矩阵
         }
 
 # ========================
@@ -173,7 +176,7 @@ class PoegraphLayoutDataset(Dataset):
 def layout_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     """
     将变长 layout_seq padding 到 batch 内最大长度
-    并堆叠 kg_vector。
+    并堆叠 kg_vector 和 kg_spatial_matrix。
     """
     input_ids = torch.stack([item['input_ids'] for item in batch])
     attention_mask = torch.stack([item['attention_mask'] for item in batch])
@@ -182,6 +185,10 @@ def layout_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     # --- NEW: 堆叠 KG 向量 ---
     # 结果形状: [Batch_Size, 9]
     kg_vectors = torch.stack([item['kg_vector'] for item in batch])
+    
+    # --- [NEW] 堆叠 KG 空间矩阵 ---
+    # 结果形状: [Batch_Size, 9, 9]
+    kg_spatial_matrices = torch.stack([item['kg_spatial_matrix'] for item in batch])
     # ------------------------
 
     # 找到最大布局长度（以 5 为单位）
@@ -212,7 +219,8 @@ def layout_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'layout_seq': torch.tensor(layout_seqs_padded, dtype=torch.long), 
         'layout_mask': torch.tensor(layout_masks, dtype=torch.float32), 
         'num_boxes': torch.tensor(num_boxes_list, dtype=torch.long),
-        'kg_vector': kg_vectors # <--- NEW: 返回堆叠后的 KG 向量
+        'kg_vector': kg_vectors, # <--- NEW: 返回堆叠后的 KG 向量
+        'kg_spatial_matrix': kg_spatial_matrices # <--- NEW: 返回堆叠后的空间矩阵
     }
 
 # ========================

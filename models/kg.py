@@ -62,9 +62,55 @@ class PoetryKnowledgeGraph:
         # 构建知识图谱
         self._build_knowledge_graph()
         
-        # --- NEW: 构建快速查找表，用于特征提取 ---
+        # 构建快速查找表，用于特征提取
         self._build_lookup_tables()
-    
+
+        # ==========================================
+        # [NEW] 空间关系定义与先验知识
+        # ==========================================
+        
+        # 1. 定义空间关系类型 (ID映射, 0为无特殊关系)
+        # 这些 ID 将被模型学习为 Attention Bias
+        self.RELATION_IDS = {
+            'none': 0,
+            'above': 1,       # A 在 B 上方 (例如：云在山/树上，或鸟在树上)
+            'below': 2,       # A 在 B 下方
+            'inside': 3,      # A 在 B 内部/重叠/被背景包含 (例如：树在山中，亭在山中)
+            'surrounds': 4,   # A 包围 B
+            'on_top': 5,      # A 在 B 顶部 (类似 above，但更强调接触，如人站在桥上)
+            'near': 6         # A 靠近 B
+        }
+        
+        # 2. 静态空间先验 (Static Priors)
+        # 定义类别对之间的默认关系 (当诗中没有明确空间词时使用)
+        # 格式: (Class_A, Class_B): Relation_ID (表示 A 相对于 B 的关系)
+        # ID 对应: 2:mtn, 3:water, 4:ppl, 5:tree, 6:bldg, 7:bridge, 8:flower, 9:bird, 10:animal
+        self.static_priors = {
+            # 山 (2) vs 水 (3) -> 山通常作为背景在水"上方"(画面上部)或"围绕"水
+            (2, 3): 1,  # Mountain(2) ABOVE Water(3) (垂直构图常见)
+            
+            # 鸟 (9) vs 树 (5)
+            (9, 5): 1,  # Bird(9) ABOVE Tree(5)
+            
+            # 鸟 (9) vs 山 (2)
+            (9, 2): 3,  # Bird(9) INSIDE Mountain(2) (鸟在山林背景中)
+            
+            # 建筑 (6) vs 山 (2)
+            (6, 2): 3,  # Building(6) INSIDE Mountain(2) (庙宇通常在山中)
+            
+            # 树 (5) vs 山 (2)
+            (5, 2): 3,  # Tree(5) INSIDE Mountain(2) (树木覆盖在山上)
+            
+            # 桥 (7) vs 水 (3)
+            (7, 3): 1,  # Bridge(7) ABOVE Water(3)
+            
+            # 人 (4) vs 桥 (7)
+            (4, 7): 5,  # People(4) ON_TOP Bridge(7)
+            
+            # 人 (4) vs 建筑 (6)
+            (4, 6): 6,  # People(4) NEAR Building(6)
+        }
+
     def _init_visual_synonyms(self):
         """初始化每个视觉类别的所有同义词和变体"""
         synonyms = {
@@ -300,7 +346,6 @@ class PoetryKnowledgeGraph:
         if head_type: self.entities[head_type].add(head)
         if tail_type: self.entities[tail_type].add(tail)
     
-    # --- NEW: 辅助方法 - 构建查找表 ---
     def _build_lookup_tables(self):
         """
         构建反向查找表，用于快速特征提取:
@@ -346,7 +391,6 @@ class PoetryKnowledgeGraph:
                 elements.add(tail)
         return elements
 
-    # --- NEW: 核心特征提取方法 ---
     def extract_visual_feature_vector(self, poem_text: str) -> torch.Tensor:
         """
         输入诗歌文本，利用KG提取视觉元素特征向量。
@@ -381,20 +425,77 @@ class PoetryKnowledgeGraph:
                         
         return visual_vector
 
+    # ==========================================
+    # [NEW] 核心空间矩阵提取方法
+    # ==========================================
+    def extract_spatial_matrix(self, poem_text: str) -> torch.Tensor:
+        """
+        生成 9x9 的空间关系矩阵。
+        Matrix[i, j] = Relation_ID (表示 Class i 与 Class j 的关系)
+        ID映射: 2:mtn, 3:water, 4:ppl, 5:tree, 6:bldg, 7:bridge, 8:flower, 9:bird, 10:animal
+        """
+        num_classes = 9
+        # 初始化为 0 (无关系)
+        relation_matrix = torch.zeros((num_classes, num_classes), dtype=torch.long)
+        
+        # 1. 获取诗中存在的物体索引 (Index 0-8)
+        feature_vec = self.extract_visual_feature_vector(poem_text)
+        present_indices = [i for i, val in enumerate(feature_vec) if val > 0]
+        
+        # 2. 应用静态先验 (Static Priors)
+        # 对所有存在的成对物体，应用默认的空间关系
+        for idx_a in present_indices:
+            for idx_b in present_indices:
+                if idx_a == idx_b: continue
+                
+                # 将 Index (0-8) 映射回 Class ID (2-10) 以查表
+                cls_a = idx_a + 2
+                cls_b = idx_b + 2
+                
+                # 检查是否存在预定义的静态关系
+                if (cls_a, cls_b) in self.static_priors:
+                    relation_matrix[idx_a, idx_b] = self.static_priors[(cls_a, cls_b)]
+
+        # 3. 动态关键词修正 (Dynamic Adjustment)
+        # 简单的规则匹配：如果诗句中包含特定的空间词，增强相关物体的关系
+        
+        # 规则 A: "高" + "树" -> 树 (Tree, ID 5, Index 3) 在其他前景物体上方
+        if '高' in poem_text and '树' in poem_text:
+            tree_idx = 5 - 2 # 3
+            if tree_idx in present_indices:
+                for other_idx in present_indices:
+                    # 避免修改树与山的包含关系 (静态先验 Tree INSIDE Mountain 优先级更高)
+                    # 这里的逻辑可以根据需要调整，目前简单地让树在其他所有物体之上（除了山）
+                    if other_idx != tree_idx and (other_idx + 2) != 2: # Ignore Mountain
+                        relation_matrix[tree_idx, other_idx] = self.RELATION_IDS['above']
+
+        # 规则 B: "幽"/"深" + "山" -> 山 (Mountain, ID 2, Index 0) 包含其他物体
+        if ('幽' in poem_text or '深' in poem_text) and '山' in poem_text:
+            mtn_idx = 2 - 2 # 0
+            if mtn_idx in present_indices:
+                for other_idx in present_indices:
+                    if other_idx != mtn_idx:
+                        # 使得其他物体(other) 被 山(mtn) 包含
+                        # Matrix[other, mtn] = INSIDE
+                        relation_matrix[other_idx, mtn_idx] = self.RELATION_IDS['inside']
+
+        return relation_matrix
+
     def visualize(self):
         """(原有可视化代码保持不变)"""
-        pass # (为了节省篇幅，此处省略，请保留您原有的 visualize 方法内容)
+        pass 
 
 # 使用示例
 if __name__ == "__main__":
     pkg = PoetryKnowledgeGraph()
     
-    test_poem_1 = "空山新雨后"
-    vec_1 = pkg.extract_visual_feature_vector(test_poem_1)
-    print(f"Poem: '{test_poem_1}' -> Vector: {vec_1.tolist()}")
-    # 预期: 空山->mountain(idx 0), 雨->rainy_day->implies water(idx 1)
+    test_poem = "山光物态弄春晖，高树鸟鸣山更幽"
     
-    test_poem_2 = "孤舟蓑笠翁，独钓寒江雪"
-    vec_2 = pkg.extract_visual_feature_vector(test_poem_2)
-    print(f"Poem: '{test_poem_2}' -> Vector: {vec_2.tolist()}")
-    # 预期: 舟->boat(other, ignored), 钓->fishing_scene->implies water(idx 1), 江->water(idx 1), 雪->winter->snow
+    print("\n--- Testing Visual Feature Extraction ---")
+    vec = pkg.extract_visual_feature_vector(test_poem)
+    print(f"Feature Vector: {vec.tolist()}")
+    
+    print("\n--- Testing Spatial Matrix Extraction ---")
+    matrix = pkg.extract_spatial_matrix(test_poem)
+    print("Spatial Relation Matrix (9x9):")
+    print(matrix)
