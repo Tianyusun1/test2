@@ -16,12 +16,12 @@ model:
   num_bbox_bins: 1000       
   cls_embed_dim: 16         
   bbox_embed_dim: 12        
-  iou_loss_weight: 200.0     # <<<< 修改: IOU 排斥损失权重 (5.0 -> 100.0)
+  iou_loss_weight: 10.0     # <<<< 修改: IOU 排斥损失权重 (5.0 -> 100.0)
   # --------------------------------------
   
   coord_loss_weight: 1.0     # BBox Token 分类损失
   reg_loss_weight: 50.0       # 连续回归损失权重
-  cls_loss_weight: 300.0     # 分类损失权重
+  cls_loss_weight: 5.0     # 分类损失权重
   count_loss_weight: 10.0   # <<<< 新增: 数量预测损失权重
   area_loss_weight: 10.0    # <<<< 新增: 面积惩罚权重 (惩罚大框)
   # Inference

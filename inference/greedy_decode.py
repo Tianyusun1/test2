@@ -1,9 +1,10 @@
+# File: tianyusun1/test2/test2-cc8b0f0a73b00d0c96a3d267fe297e6b8a7891be/inference/greedy_decode.py
+
 import torch
 import numpy as np
 import math
 # Note: We assume Poem2LayoutGenerator and its dependencies are importable
 # via sys.path manipulation in the calling script (e.g., scripts/infer.py)
-# from models.poem2layout import Poem2LayoutGenerator # Import is implicit
 
 # --- NEW: Import KG ---
 # 假设 models/kg.py 位于搜索路径中
@@ -117,7 +118,7 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements: int = 2
             next_h_logits = model.h_head(last_output)
 
             # Greedy selection for classes
-            next_cls_id = next_cls_logits.argmax(dim=-1) # [B]
+            next_cls_id = next_cls_logits.argmax(dim=-1) # [B] (Internal ID 0-9)
             
             # Greedy selection for BBox IDs (Argmax on Logits)
             next_cx_id = next_cx_logits.argmax(dim=-1) # [B]
@@ -128,7 +129,8 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements: int = 2
             next_bbox_ids = torch.stack([next_cx_id, next_cy_id, next_w_id, next_h_id], dim=1)
 
             # --- Stopping Condition (EOS) ---
-            is_eos = (next_cls_id == model.eos_token_id)
+            # is_eos = (next_cls_id == model.eos_token_id) # 原代码: 使用 ID 1 (现在 ID 1 是元素 2)
+            is_eos = (next_cls_id == 0) # <<< MODIFIED: EOS 对应的内部索引是 0
             if is_eos.all():
                 break
 
@@ -145,12 +147,16 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements: int = 2
 
         layout = []
         for cls_id_tensor, bbox_float_tensor in zip(final_cls_ids, final_bboxes_float):
-            internal_cls_id = cls_id_tensor.item()
+            internal_cls_id = cls_id_tensor.item() # Internal ID (0-9)
             
-            if internal_cls_id < 0 or internal_cls_id >= model.num_element_classes:
-                continue 
+            # if internal_cls_id < 0 or internal_cls_id >= model.num_element_classes: # 原代码: 检查 0-8
+            #     continue 
             
-            original_cls_id = internal_cls_id + 2
+            if internal_cls_id == 0: # <<< MODIFIED: Internal ID 0 is EOS
+                continue
+            
+            # original_cls_id = internal_cls_id + 2 # 原代码: internal 1->3
+            original_cls_id = internal_cls_id + 1 # <<< MODIFIED: Map internal 1-9 to original 2-10
             
             cx, cy, w, h = bbox_float_tensor.tolist()
             layout.append((original_cls_id, cx, cy, w, h))

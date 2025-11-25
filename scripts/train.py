@@ -1,4 +1,5 @@
-# File: scripts/train.py
+# File: tianyusun1/test2/test2-cc8b0f0a73b00d0c96a3d267fe297e6b8a7891be/scripts/train.py
+
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
 import os
@@ -22,46 +23,64 @@ from collections import Counter
 import numpy as np 
 
 # --- 辅助函数：计算类别权重 (解决类别偏差问题) ---
-# **已修改: 包含 max_weight_ratio 参数和钳位逻辑**
+# **已修改: 确保返回 10 个权重 (1 个 EOS + 9 个元素)**
 def compute_class_weights(dataset, num_classes: int, max_weight_ratio: float = 3.0):
     """
     计算数据集内所有布局元素的类别频率，并返回反向频率权重。
-    权重公式: w_i = 1.0 / log(1.02 + p_i)
+    
+    MODIFIED: 返回 (num_classes + 1) 个权重，其中索引 0 对应 EOS。
+    num_classes: 9 (元素的数量)
     """
-    class_counts = Counter()
+    element_class_counts = Counter()
     
     # 遍历整个数据集计算所有元素实例的类别计数
     for sample in dataset.data:
         # boxes 是 List[(cls_id, cx, cy, w, h)]，cls_id 是 2.0 - 10.0
         for cls_id_float, _, _, _, _ in sample['boxes']:
-            # 映射到内部 ID 0-8
-            internal_cls_id = int(cls_id_float) - 2
-            if 0 <= internal_cls_id < num_classes:
-                class_counts[internal_cls_id] += 1
+            # 映射到内部 ID 0-8 (对应元素 2-10)
+            internal_element_id = int(cls_id_float) - 2
+            if 0 <= internal_element_id < num_classes:
+                element_class_counts[internal_element_id] += 1
                 
-    total_count = sum(class_counts.values())
+    total_count = sum(element_class_counts.values())
+    
+    # 最终权重数组大小必须是 9 (元素) + 1 (EOS) = 10
+    final_num_classes = num_classes + 1 
     
     if total_count == 0:
         print("[Warning] No valid elements found in dataset for weight calculation. Using uniform weights.")
-        return torch.ones(num_classes)
+        return torch.ones(final_num_classes)
 
-    weights = torch.zeros(num_classes)
+    # 初始化权重: size 10 (索引 0 for EOS, 索引 1-9 for elements)
+    weights = torch.zeros(final_num_classes) 
     
-    # 计算频率 p_i
-    for i in range(num_classes):
-        frequency = class_counts.get(i, 0) / total_count
+    # 计算 9 个元素 (内部 ID 0-8) 的权重，并将它们存储在索引 1-9
+    for i in range(num_classes): # i goes from 0 to 8 (internal element ID)
+        frequency = element_class_counts.get(i, 0) / total_count
+        
+        # 将元素的内部 ID i (0-8) 映射到新的索引 i+1 (1-9)
+        new_index = i + 1 
+        
         if frequency > 0:
             # 采用 log(1.0 + x) 或 log(1.02 + x) 来平滑和反转频率
-            weights[i] = 1.0 / np.log(1.02 + frequency) 
+            weights[new_index] = 1.0 / np.log(1.02 + frequency) 
         else:
             # 对于稀有/不存在的类别，赋予最高的权重
-            weights[i] = 1.0 / np.log(1.02 + 1e-6) # 赋予最大权重
+            weights[new_index] = 1.0 / np.log(1.02 + 1e-6) # 赋予最大权重
+            
+    # 为 EOS 类 (索引 0) 分配权重
+    # 我们使用计算出的元素权重的平均值作为基线
+    avg_element_weight = weights[1:].sum() / num_classes if num_classes > 0 else 1.0
+    weights[0] = avg_element_weight # 将平均权重分配给 EOS (索引 0)
             
     # 权重钳位和标准化
+    # 对所有 10 个类别计算平均权重
     avg_weight = weights.mean()
     max_allowed_weight = avg_weight * max_weight_ratio
     weights = torch.clamp(weights, max=max_allowed_weight)
-    weights = weights / weights.sum() * num_classes
+    
+    # 重新归一化，确保总和是 final_num_classes (10)
+    weights = weights / weights.sum() * final_num_classes
     
     return weights.float()
 # ------------------------------------------
@@ -88,7 +107,9 @@ def main():
     # --- 计算类别权重 ---
     num_element_classes = model_config['num_classes'] # 9
     class_weights_tensor = compute_class_weights(dataset, num_element_classes)
-    print(f"Calculated Class Weights (Internal 0-8): {class_weights_tensor.tolist()}")
+    
+    # **修改 2.1: 修正打印输出，反映新的 10 类权重**
+    print(f"Calculated Class Weights (Internal 0:EOS, 1-9:Elements 2-10): {class_weights_tensor.tolist()}")
     # ---------------------------
 
     # 3. Init model (传入所有损失权重，包括新增的 Reg, Cls, Count, Area)

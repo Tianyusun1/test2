@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-16cf527f423e4c3eeef5db4d1111eb08bc4760b7/models/poem2layout.py
+# File: tianyusun1/test2/test2-cc8b0f0a73b00d0c96a3d267fe297e6b8a7891be/models/poem2layout.py
 
 import torch
 import torch.nn as nn
@@ -9,8 +9,8 @@ from .decoder import LayoutDecoder
 
 class Poem2LayoutGenerator(nn.Module):
     # num_classes: 实际的布局元素类别数 (例如：9)
-    # **修改 1: 增加 cls_loss_weight 和 count_loss_weight 参数**
-    def __init__(self, bert_path: str, num_classes: int, num_bbox_bins: int, bbox_embed_dim: int, hidden_size: int = 768, bb_size: int = 64, decoder_layers: int = 4, decoder_heads: int = 8, dropout: float = 0.1, coord_loss_weight: float = 1.0, iou_loss_weight: float = 0.1, reg_loss_weight: float = 1.0, cls_loss_weight: float = 1.0, count_loss_weight: float = 1.0, class_weights: torch.Tensor = None):
+    # **修改 1: 增加 area_loss_weight 参数 (修复 TypeError)**
+    def __init__(self, bert_path: str, num_classes: int, num_bbox_bins: int, bbox_embed_dim: int, hidden_size: int = 768, bb_size: int = 64, decoder_layers: int = 4, decoder_heads: int = 8, dropout: float = 0.1, coord_loss_weight: float = 1.0, iou_loss_weight: float = 0.1, reg_loss_weight: float = 1.0, cls_loss_weight: float = 1.0, count_loss_weight: float = 1.0, area_loss_weight: float = 1.0, class_weights: torch.Tensor = None): # <<< NEW: 增加 area_loss_weight
         super(Poem2LayoutGenerator, self).__init__()
         
         self.num_element_classes = num_classes 
@@ -23,6 +23,7 @@ class Poem2LayoutGenerator(nn.Module):
         self.reg_loss_weight = reg_loss_weight 
         self.cls_loss_weight = cls_loss_weight # <<<< 存储 cls_loss_weight
         self.count_loss_weight = count_loss_weight # <<<< 存储 count_loss_weight
+        self.area_loss_weight = area_loss_weight # <<< NEW: 存储 area_loss_weight
         
         if class_weights is not None:
             self.register_buffer('class_weights', class_weights)
@@ -75,7 +76,8 @@ class Poem2LayoutGenerator(nn.Module):
         decoder_output_size = hidden_size + bb_size
         
         # 分类头仍预测布局元素的数量 (9 类)
-        self.cls_head = nn.Linear(decoder_output_size, self.num_element_classes)
+        # self.cls_head = nn.Linear(decoder_output_size, self.num_element_classes) # 原代码
+        self.cls_head = nn.Linear(decoder_output_size, self.num_element_classes + 1) # <<< MODIFIED: 预测 10 类 (9元素 + EOS)
         
         # 4 个 BBox 坐标的分类头 (用于 L_coord)
         self.cx_head = nn.Linear(decoder_output_size, self.num_bbox_bins)
@@ -124,7 +126,7 @@ class Poem2LayoutGenerator(nn.Module):
         decoder_output = self.layout_decoder(layout_embed, text_encoded, src_mask, trg_mask) # [B, num_elements, H + bb_size]
 
         # Cls prediction
-        pred_cls = self.cls_head(decoder_output) # [B, num_elements, num_element_classes]
+        pred_cls = self.cls_head(decoder_output) # [B, num_elements, num_element_classes + 1]
         
         # 4 BBox Token Predictions (Classification for L_coord)
         pred_cx_id = self.cx_head(decoder_output) # [B, T, num_bbox_bins]
@@ -271,15 +273,17 @@ class Poem2LayoutGenerator(nn.Module):
             target_bbox_ids = target_bbox_ids[:, :min_seq_len, :] # [B, min_S, 4]
             cls_mask = cls_mask[:, :min_seq_len] 
             
-        # === Core Processing: Map Target ID and Mask ===
-        valid_cls_target_mask = (target_cls_ids >= 2) & (target_cls_ids <= 10) # [B, S]
-        # Map original IDs (2-10) to internal IDs (0-8)
-        target_cls_ids_mapped = torch.clamp(target_cls_ids - 2, min=0, max=self.num_element_classes - 1)
+        # === Core Processing: Map Target ID and Mask (修正 EOS 逻辑) ===
+        
+        # 1. Cls Loss Target Mask: 包含 EOS (1) 和元素 ID (2-10)
+        valid_cls_target_mask = (target_cls_ids >= 1) & (target_cls_ids <= 10) # [B, S] <<< MODIFIED: Include EOS (ID 1)
+        # 2. Cls Loss Target Mapping: Map ID 1->0, ID 2->1, ..., ID 10->9
+        target_cls_ids_mapped = torch.clamp(target_cls_ids - 1, min=0, max=self.num_element_classes) # [B, S] <<< MODIFIED
+        
         final_cls_mask = cls_mask & valid_cls_target_mask # [B, S]
         final_cls_mask_flat = final_cls_mask.view(-1)
         
         # --- 1. Classification Loss (Cls ID - remains Cross-Entropy) ---
-        # ... (L_cls 计算逻辑保持不变) ...
         pred_cls_flat = pred_cls.view(-1, pred_cls.size(-1)) 
         target_cls_ids_flat = target_cls_ids_mapped.view(-1) 
         
@@ -293,7 +297,8 @@ class Poem2LayoutGenerator(nn.Module):
         )
         
         if self.class_weights is not None:
-            weights = self.class_weights[target_cls_valid]
+            # 注意: target_cls_valid 现在包含 ID 0 (EOS)
+            weights = self.class_weights[target_cls_valid] 
             cls_loss_weighted = cls_loss_per_element * weights
         else:
             cls_loss_weighted = cls_loss_per_element
@@ -302,10 +307,13 @@ class Poem2LayoutGenerator(nn.Module):
 
 
         # --- 2. Coordinate Loss (BBox Token IDs - L_coord Cross-Entropy) ---
-        # ... (L_coord 计算逻辑保持不变) ...
+        # Coord Loss 必须排除 EOS (ID 1)
+        valid_coord_target_mask = (target_cls_ids >= 2) & (target_cls_ids <= 10) # [B, S] <<< NEW MASK for Coord (Only elements)
+        
+        coord_mask_flat = (cls_mask & valid_coord_target_mask).unsqueeze(-1).expand(-1, -1, 4).flatten() # <<< MODIFIED: 只计算元素 (2-10) 的坐标损失
+        
         pred_bbox_flat = pred_bbox_ids.flatten(0, 2) # [B*S*4, num_bins]
         target_bbox_flat = target_bbox_ids.flatten()
-        coord_mask_flat = final_cls_mask.unsqueeze(-1).expand(-1, -1, 4).flatten() 
         
         pred_bbox_valid = pred_bbox_flat[coord_mask_flat]
         target_bbox_valid = target_bbox_flat[coord_mask_flat]
@@ -315,7 +323,7 @@ class Poem2LayoutGenerator(nn.Module):
             target_bbox_valid,
             reduction='sum'
         )
-        num_valid_tokens = final_cls_mask_flat.sum().clamp(min=1) * 4 
+        num_valid_tokens = (cls_mask & valid_coord_target_mask).sum().clamp(min=1) * 4 # <<< MODIFIED: 修正 num_valid_tokens
         coord_loss = coord_loss / num_valid_tokens
         
         
@@ -327,7 +335,8 @@ class Poem2LayoutGenerator(nn.Module):
         reg_loss_per_coord = F.smooth_l1_loss(pred_coord_float, target_coord_float.detach(), reduction='none') # [B, S, 4]
         
         # 应用掩码并归一化
-        reg_loss = reg_loss_per_coord * final_cls_mask.unsqueeze(-1).float()
+        reg_loss_mask = (cls_mask & valid_coord_target_mask).unsqueeze(-1).float() # <<< MODIFIED: 掩码排除 EOS
+        reg_loss = reg_loss_per_coord * reg_loss_mask
         reg_loss = reg_loss.sum() / num_valid_tokens
         
 
@@ -335,22 +344,38 @@ class Poem2LayoutGenerator(nn.Module):
         # **关键修复: L_iou 现在使用连续回归头的预测结果 pred_coord_float**
         iou_loss = self._compute_iou_loss(
             pred_boxes=pred_coord_float, 
-            valid_mask=final_cls_mask,
+            valid_mask=(cls_mask & valid_coord_target_mask), # <<< MODIFIED: 掩码排除 EOS
             iou_threshold=0.5
         )
+
+        # --- 5. Area Penalty Loss (L_area) --- <<< NEW: 实现 Area Loss
+        # L1 惩罚预测框的面积 (w * h)
+        pred_area = pred_coord_float[..., 2] * pred_coord_float[..., 3] # [B, S] (w * h)
         
-        # --- 5. Count Prediction Loss (L_count) ---
+        # 使用 L1 损失惩罚面积本身（目标面积为 0.0）
+        area_loss_per_element = torch.abs(pred_area) # [B, S]
+        
+        # 应用掩码并归一化
+        area_loss_mask = (cls_mask & valid_coord_target_mask).float() # <<< MODIFIED: 掩码排除 EOS
+        num_valid_elements = area_loss_mask.sum().clamp(min=1)
+        
+        area_loss = area_loss_per_element * area_loss_mask
+        area_loss = area_loss.sum() / num_valid_elements # 归一化到每个有效元素
+        # ------------------------------------
+        
+        # --- 6. Count Prediction Loss (L_count) ---
         # **修改 7: 计算 L_count**
         target_count = target_num_boxes.float().unsqueeze(1) # [B, 1]
         count_loss = F.smooth_l1_loss(pred_count, target_count)
         
-        # --- 6. Combine Losses ---
-        # **修改 8: L_total 增加 L_count (应用各自的权重)**
+        # --- 7. Combine Losses ---
+        # **修改 8: L_total 增加 L_count 和 L_area (应用各自的权重)**
         total_loss = (self.cls_loss_weight * cls_loss) + \
                      (self.coord_loss_weight * coord_loss) + \
                      (self.reg_loss_weight * reg_loss) + \
                      (self.iou_loss_weight * iou_loss) + \
-                     (self.count_loss_weight * count_loss)
+                     (self.count_loss_weight * count_loss) + \
+                     (self.area_loss_weight * area_loss) # <<< NEW: 添加 Area Loss
         
-        # **修改 9: 返回值增加 count_loss**
-        return total_loss, cls_loss, coord_loss, reg_loss, iou_loss, count_loss
+        # **修改 9: 返回值增加 count_loss 和 area_loss**
+        return total_loss, cls_loss, coord_loss, reg_loss, iou_loss, count_loss, area_loss # <<< NEW: 返回 Area Loss
