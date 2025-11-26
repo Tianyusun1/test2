@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-2.0/trainers/trainer.py (FINAL FIXED)
+# File: tianyusun1/test2/test2-2.0/trainers/trainer.py (FINAL: WEIGHTS + KG PRINT)
 
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
@@ -78,15 +78,15 @@ class LayoutTrainer:
         # 最佳模型路径追踪
         self.current_best_model_path = None
         
-        # 损失历史追踪
+        # 损失历史追踪 (扩充以监控所有新 Loss)
         self.train_loss_history = []
         self.val_loss_history = []
-        self.val_cls_history = []
-        self.val_coord_history = []
         self.val_reg_history = [] 
         self.val_iou_history = []
-        self.val_count_history = [] 
         self.val_area_history = [] 
+        self.val_relation_history = [] # [NEW]
+        self.val_overlap_history = []  # [NEW]
+        self.val_size_history = []     # [NEW]
 
     def _get_lr_scheduler(self):
         """定义带线性 Warmup、5 Epoch Hold 和后续衰减的学习率调度器。"""
@@ -115,37 +115,36 @@ class LayoutTrainer:
         
         # 初始化运行损失变量
         total_loss = 0.0
-        total_cls_loss = 0.0
-        total_coord_loss = 0.0
         total_reg_loss = 0.0 
         total_iou_loss = 0.0
-        total_count_loss = 0.0 
         total_area_loss = 0.0
+        total_relation_loss = 0.0 # [NEW]
+        total_overlap_loss = 0.0  # [NEW]
+        total_size_loss = 0.0     # [NEW]
         
         context_manager = contextlib.nullcontext() if is_training else torch.no_grad()
         
         with context_manager:
             for step, batch in enumerate(data_loader):
-                # 1. 将数据移至设备 (适配新的 layout_collate_fn 返回的 keys)
+                # 1. 将数据移至设备
                 input_ids = batch['input_ids'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
+                kg_class_ids = batch['kg_class_ids'].to(self.device) 
+                padding_mask = batch['padding_mask'].to(self.device) 
+                target_boxes = batch['target_boxes'].to(self.device) 
+                loss_mask = batch['loss_mask'].to(self.device)       
                 
-                # [NEW] Query-Based Inputs
-                kg_class_ids = batch['kg_class_ids'].to(self.device) # [B, S]
-                padding_mask = batch['padding_mask'].to(self.device) # [B, S]
-                
-                # [NEW] GT & Masks
-                target_boxes = batch['target_boxes'].to(self.device) # [B, S, 4]
-                loss_mask = batch['loss_mask'].to(self.device)       # [B, S]
-                
+                # [NEW] 提取 KG Weights (用于 Size Loss)
+                kg_class_weights = None
+                if 'kg_class_weights' in batch:
+                    kg_class_weights = batch['kg_class_weights'].to(self.device)
+
                 # KG Spatial Matrix
                 kg_spatial_matrix = None
                 if 'kg_spatial_matrix' in batch:
                     kg_spatial_matrix = batch['kg_spatial_matrix'].to(self.device)
                 
-                # 2. 前向传播 (Query-Based)
-                # 只需要传入 input_ids, mask, queries(kg_class_ids), padding_mask
-                # 返回的元组结构: (None, None, pred_boxes, None)
+                # 2. 前向传播
                 _, _, pred_boxes, _ = self.model(
                     input_ids=input_ids, 
                     attention_mask=attention_mask, 
@@ -155,61 +154,62 @@ class LayoutTrainer:
                 )
                 
                 # 3. 计算损失
-                # 注意：现在的 get_loss 需要传入 pred_boxes, target_boxes, loss_mask
-                # 我们将 loss_mask 传给 layout_mask 参数位置，target_boxes 传给 target_coords_gt
+                # [MODIFIED] 传入 kg_spatial_matrix 和 kg_class_weights
                 loss_tuple = self.model.get_loss(
                     pred_cls=None, 
                     pred_bbox_ids=None, 
-                    pred_boxes=pred_boxes, # 主要预测值
+                    pred_boxes=pred_boxes, 
                     pred_count=None, 
                     layout_seq=None, 
-                    layout_mask=loss_mask, # 传入 Loss Mask (1=Valid, 0=Ignore)
-                    num_boxes=None,
-                    target_coords_gt=target_boxes # 传入无损真值
+                    layout_mask=loss_mask, 
+                    num_boxes=batch['num_boxes'].to(self.device), 
+                    target_coords_gt=target_boxes,
+                    kg_spatial_matrix=kg_spatial_matrix, # [NEW] Relation/Overlap Loss
+                    kg_class_weights=kg_class_weights    # [NEW] Size Loss (Implicit object shrinking)
                 )
                 
-                # 解包损失 (共7个)
-                total_loss_item, cls_loss, coord_loss, reg_loss, iou_loss, count_loss, area_loss = loss_tuple
+                # 解包损失: total, relation, overlap, reg, iou, size, area
+                loss_total_item, relation_loss, overlap_loss, reg_loss, iou_loss, size_loss, area_loss = loss_tuple
                 
                 if is_training:
                     # 4. 训练步骤
                     self.optimizer.zero_grad()
-                    total_loss_item.backward()
+                    loss_total_item.backward()
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     self.optimizer.step()
                     
                     self.scheduler.step()
                     self.global_step += 1
                 
-                # 累加所有损失 (item() 转为 python float)
-                total_loss += total_loss_item.item()
-                total_cls_loss += cls_loss.item()
-                total_coord_loss += coord_loss.item()
+                # 累加所有损失
+                total_loss += loss_total_item.item()
                 total_reg_loss += reg_loss.item()
                 total_iou_loss += iou_loss.item()
-                total_count_loss += count_loss.item()
                 total_area_loss += area_loss.item()
+                total_relation_loss += relation_loss.item()
+                total_overlap_loss += overlap_loss.item()
+                total_size_loss += size_loss.item()
                 
                 # 5. 打印日志 (Training log)
                 if is_training and (step + 1) % self.log_steps == 0:
                     current_lr = self.optimizer.param_groups[0]['lr']
                     print(f"Epoch [TRAIN] Step {step+1}/{len(data_loader)} | "
                           f"LR: {current_lr:.6e} | "
-                          f"Total: {total_loss_item.item():.4f} | "
+                          f"Total: {loss_total_item.item():.4f} | "
+                          f"Rel: {relation_loss.item():.4f} | "  # [NEW]
+                          f"Over: {overlap_loss.item():.4f} | " # [NEW]
                           f"Reg: {reg_loss.item():.4f} | " 
-                          f"IoU: {iou_loss.item():.4f} | "
-                          f"Area: {area_loss.item():.4f}") 
-                          # Cls/Coord/Count will be 0, omitted for brevity in step log
+                          f"IoU: {iou_loss.item():.4f}")
         
         # 计算平均损失
         num_batches = len(data_loader)
         return (
             total_loss / num_batches,
-            total_cls_loss / num_batches,
-            total_coord_loss / num_batches,
+            total_relation_loss / num_batches,
+            total_overlap_loss / num_batches,
             total_reg_loss / num_batches,
             total_iou_loss / num_batches,
-            total_count_loss / num_batches,
+            total_size_loss / num_batches,
             total_area_loss / num_batches
         )
 
@@ -219,23 +219,26 @@ class LayoutTrainer:
         print("\n--- Starting Validation ---")
         
         avg_losses = self._run_epoch(self.val_loader, is_training=False)
-        avg_val_loss, avg_val_cls, avg_val_coord, avg_val_reg, avg_val_iou, avg_val_count, avg_val_area = avg_losses
+        # 解包 7 个值
+        avg_val_loss, avg_rel, avg_over, avg_reg, avg_iou, avg_size, avg_area = avg_losses
         
         end_time = time.time()
         print(f"--- Validation Finished in {end_time - start_time:.2f}s ---")
         
         self.val_loss_history.append(avg_val_loss)
-        self.val_cls_history.append(avg_val_cls)
-        self.val_coord_history.append(avg_val_coord)
-        self.val_reg_history.append(avg_val_reg) 
-        self.val_iou_history.append(avg_val_iou)
-        self.val_count_history.append(avg_val_count)
-        self.val_area_history.append(avg_val_area) 
+        self.val_reg_history.append(avg_reg) 
+        self.val_iou_history.append(avg_iou)
+        self.val_area_history.append(avg_area) 
+        self.val_relation_history.append(avg_rel) # [NEW]
+        self.val_overlap_history.append(avg_over) # [NEW]
+        self.val_size_history.append(avg_size)    # [NEW]
         
-        print(f"Validation Avg Loss: Total: {avg_val_loss:.4f} | "
-              f"Reg: {avg_val_reg:.4f} | " 
-              f"IoU: {avg_val_iou:.4f} | "
-              f"Area: {avg_val_area:.4f}") 
+        print(f"Val Avg Loss: Total: {avg_val_loss:.4f} | "
+              f"Rel: {avg_rel:.4f} | "
+              f"Over: {avg_over:.4f} | "
+              f"Reg: {avg_reg:.4f} | " 
+              f"IoU: {avg_iou:.4f} | "
+              f"Area: {avg_area:.4f}") 
               
         return avg_val_loss
 
@@ -245,15 +248,16 @@ class LayoutTrainer:
         print("\n--- Starting Test Set Evaluation ---")
         
         avg_losses = self._run_epoch(self.test_loader, is_training=False)
-        avg_test_loss, _, _, avg_test_reg, avg_test_iou, _, avg_test_area = avg_losses
+        avg_test_loss, avg_rel, avg_over, avg_reg, avg_iou, avg_size, avg_area = avg_losses
         
         end_time = time.time()
         print(f"--- Test Finished in {end_time - start_time:.2f}s ---")
         
         print(f"Test Avg Loss: Total: {avg_test_loss:.4f} | "
-              f"Reg: {avg_test_reg:.4f} | " 
-              f"IoU: {avg_test_iou:.4f} | "
-              f"Area: {avg_test_area:.4f}") 
+              f"Rel: {avg_rel:.4f} | "
+              f"Over: {avg_over:.4f} | "
+              f"Reg: {avg_reg:.4f} | " 
+              f"IoU: {avg_iou:.4f}") 
               
         return avg_test_loss
 
@@ -261,9 +265,35 @@ class LayoutTrainer:
         """运行固定样例的推理并保存可视化图片"""
         print(f"\n--- Running Inference Example for Epoch {epoch+1} ---")
         poem_text = self.example_poem['poem']
+        
+        # === [MODIFIED] 打印测试样本的 KG 信息 ===
+        print(f"Poem: {poem_text}")
+        try:
+            # 处理 Subset 包装的情况
+            ds = self.train_loader.dataset
+            if hasattr(ds, 'dataset'):
+                ds = ds.dataset
+                
+            if hasattr(ds, 'pkg'):
+                pkg = ds.pkg
+                # 1. 打印物体
+                kg_vector = pkg.extract_visual_feature_vector(poem_text)
+                # 转为 ID 列表
+                indices = torch.nonzero(kg_vector).squeeze(1).tolist()
+                # 内部 index 0-8 对应 ID 2-10
+                ids = [i + 2 for i in indices]
+                print(f"KG Objects (IDs): {ids}")
+                
+                # 2. 打印空间矩阵
+                print("KG Spatial Matrix:")
+                matrix = pkg.extract_spatial_matrix(poem_text)
+                print(matrix)
+        except Exception as e:
+            print(f"[Warning] Could not print KG info: {e}")
+        # =========================================
+
         max_elements = self.config['model'].get('max_elements', 30)
         
-        # 调用贪婪解码 (注意：现在是 Query-Based 一次性预测，非贪婪，但接口名保持兼容)
         layout = greedy_decode_poem_layout(
             self.model, 
             self.tokenizer, 
@@ -276,7 +306,6 @@ class LayoutTrainer:
         draw_layout(layout, f"PRED: {poem_text}", output_path)
         print(f"-> Generated layout saved to {output_path}")
 
-        # 可视化真实布局（注意：这里的 boxes 是 dataset 里的 raw boxes list，包含 cls_id）
         true_boxes = self.example_poem['boxes']
         true_layout_path = os.path.join(self.output_dir, f"epoch_{epoch+1}_layout_true.png")
         draw_layout(true_boxes, f"TRUE: {poem_text}", true_layout_path)
@@ -291,15 +320,16 @@ class LayoutTrainer:
         epochs = range(1, len(self.train_loss_history) + 1)
         plt.figure(figsize=(10, 6))
         
-        plt.plot(epochs, self.train_loss_history, label='Train Total Loss', marker='.', linestyle='-')
-        plt.plot(epochs, self.val_loss_history, label='Validation Total Loss', marker='.', linestyle='-')
+        plt.plot(epochs, self.train_loss_history, label='Train Total', marker='.', linestyle='-')
+        plt.plot(epochs, self.val_loss_history, label='Val Total', marker='.', linestyle='-')
         
         if len(self.val_reg_history) > 1:
-            plt.plot(epochs, self.val_reg_history, label='Val Reg Loss', linestyle='--') 
-            plt.plot(epochs, self.val_iou_history, label='Val IoU Loss', linestyle='--')
-            plt.plot(epochs, self.val_area_history, label='Val Area Loss', linestyle='--') 
+            plt.plot(epochs, self.val_relation_history, label='Relation(KG)', linestyle=':') # [NEW]
+            plt.plot(epochs, self.val_overlap_history, label='Overlap', linestyle=':')     # [NEW]
+            plt.plot(epochs, self.val_reg_history, label='Reg', linestyle='--', alpha=0.5) 
+            plt.plot(epochs, self.val_iou_history, label='IoU', linestyle='--', alpha=0.5)
 
-        plt.title('Loss Trajectory Over Epochs')
+        plt.title('Loss Trajectory (KG & Logic Enhanced)')
         plt.xlabel('Epoch')
         plt.ylabel('Loss Value')
         plt.legend()

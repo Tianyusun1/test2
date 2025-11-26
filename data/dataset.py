@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-2.0/data/dataset.py (FINAL QUERY-BASED FIXED)
+# File: tianyusun1/test2/test2-2.0/data/dataset.py (FINAL WEIGHT AWARE + CLEANING)
 
 import os
 import torch
@@ -110,25 +110,28 @@ class PoegraphLayoutDataset(Dataset):
 
         # 2. KG 提取内容 (Query Generation)
         # extract_visual_feature_vector 返回 [9] 的 multi-hot
+        # 1.0 = Explicit, 0.5 = Implicit
         kg_vector = self.pkg.extract_visual_feature_vector(poem)
         kg_spatial_matrix = self.pkg.extract_spatial_matrix(poem)
         
-        # 将 vector (0/1) 转为具体的类别 ID 列表 (2-10)
-        # indices: 0-8 -> class ids: 2-10
+        # 将 vector (0/1/0.5) 转为具体的类别 ID 列表 (2-10)
         existing_indices = torch.nonzero(kg_vector > 0).squeeze(1)
+        
+        # [A] ID 列表
         kg_class_ids = (existing_indices + 2).tolist() 
         
-        # 如果 KG 没提取到任何东西，为了防止报错，加一个 PAD(0) 或特殊处理
-        # 这里我们假设至少有一个，如果没有，给一个占位符 0 (PAD)
+        # [B] 权重列表 (1.0 or 0.5) [NEW]
+        kg_class_weights = kg_vector[existing_indices].tolist()
+
         if not kg_class_ids:
             kg_class_ids = [0]
+            kg_class_weights = [0.0]
 
-        # 3. GT 对齐 (Alignment Logic)
-        # 我们要构建 target_boxes，其长度必须与 kg_class_ids 一致
+        # 3. GT 对齐与清洗 (Alignment & Cleaning Logic)
         target_boxes = []
-        loss_mask = [] # 1.0: 有GT, 0.0: 无GT(漏标)
+        loss_mask = [] # 1.0: 有效GT, 0.0: 无GT或脏数据
 
-        # 将 GT 按类别分组: {class_id: [[cx,cy,w,h], ...]}
+        # 将 GT 按类别分组
         gt_dict = {}
         for item in gt_boxes:
             cid, cx, cy, w, h = item
@@ -136,7 +139,7 @@ class PoegraphLayoutDataset(Dataset):
             if cid not in gt_dict: gt_dict[cid] = []
             gt_dict[cid].append([cx, cy, w, h])
 
-        # 遍历 KG 要求的每个物体，去 GT 里找
+        # 遍历 KG 要求的每个物体
         for k_cls in kg_class_ids:
             k_cls = int(k_cls)
             if k_cls == 0: # PAD
@@ -145,13 +148,25 @@ class PoegraphLayoutDataset(Dataset):
                 continue
 
             if k_cls in gt_dict and len(gt_dict[k_cls]) > 0:
-                # 找到了 -> 取出一个作为 Target
-                # 策略: pop(0) 取第一个匹配的，避免重复匹配同一个 GT
-                box = gt_dict[k_cls].pop(0)
+                # 找到了 -> 取出
+                box = gt_dict[k_cls].pop(0) # [cx, cy, w, h]
                 
-                # [几何增强] 仅在训练时对 GT 坐标做微小扰动
-                # 这里为了简化，直接在 getitem 里做
-                # 也可以在 trainer 里做，这里加上简单的噪声
+                # === [NEW] 脏数据过滤逻辑 ===
+                # 1. 过滤掉面积过大的框 (例如超过 90% 画幅)
+                if box[2] * box[3] > 0.90:
+                    target_boxes.append([0.0, 0.0, 0.0, 0.0])
+                    loss_mask.append(0.0) 
+                    continue
+                
+                # 2. 过滤掉长宽比极端的框
+                aspect_ratio = box[2] / (box[3] + 1e-6)
+                if aspect_ratio > 10.0 or aspect_ratio < 0.1:
+                    target_boxes.append([0.0, 0.0, 0.0, 0.0])
+                    loss_mask.append(0.0)
+                    continue
+                # ===========================
+                
+                # [几何增强]
                 noise = np.random.uniform(-0.01, 0.01, size=4)
                 box_aug = [
                     np.clip(box[0] + noise[0], 0.0, 1.0),
@@ -162,13 +177,14 @@ class PoegraphLayoutDataset(Dataset):
                 target_boxes.append(box_aug)
                 loss_mask.append(1.0)
             else:
-                # KG 说有，但 GT 没标 -> Target 填 0，Mask 设为 0 (不计算 Loss)
+                # KG 说有，但 GT 没标
                 target_boxes.append([0.0, 0.0, 0.0, 0.0])
                 loss_mask.append(0.0)
 
         # 限制最大长度
         if len(kg_class_ids) > self.max_layout_length:
             kg_class_ids = kg_class_ids[:self.max_layout_length]
+            kg_class_weights = kg_class_weights[:self.max_layout_length] # [NEW] Trim
             target_boxes = target_boxes[:self.max_layout_length]
             loss_mask = loss_mask[:self.max_layout_length]
 
@@ -176,63 +192,65 @@ class PoegraphLayoutDataset(Dataset):
             'input_ids': tokenized['input_ids'].squeeze(0), 
             'attention_mask': tokenized['attention_mask'].squeeze(0), 
             'kg_class_ids': torch.tensor(kg_class_ids, dtype=torch.long),
+            'kg_class_weights': torch.tensor(kg_class_weights, dtype=torch.float32), # [NEW]
             'target_boxes': torch.tensor(target_boxes, dtype=torch.float32),
             'loss_mask': torch.tensor(loss_mask, dtype=torch.float32),
             'kg_spatial_matrix': kg_spatial_matrix,
             'kg_vector': kg_vector,
-            'num_boxes': torch.tensor(len(gt_boxes), dtype=torch.long) # 仅用于记录
+            'num_boxes': torch.tensor(len(gt_boxes), dtype=torch.long)
         }
 
 def layout_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
-    """
-    Collate function to handle variable length kg_class_ids.
-    """
+    """Collate function to handle variable length kg_class_ids."""
     input_ids = torch.stack([item['input_ids'] for item in batch])
     attention_mask = torch.stack([item['attention_mask'] for item in batch])
     kg_spatial_matrices = torch.stack([item['kg_spatial_matrix'] for item in batch])
     kg_vectors = torch.stack([item['kg_vector'] for item in batch])
     num_boxes = torch.stack([item['num_boxes'] for item in batch])
 
-    # Find max length in this batch
     lengths = [len(item['kg_class_ids']) for item in batch]
     max_len = max(lengths)
-    if max_len == 0: max_len = 1 # 防止空 batch
+    if max_len == 0: max_len = 1
 
     batched_class_ids = []
+    batched_class_weights = [] # [NEW]
     batched_target_boxes = []
     batched_loss_mask = []
-    batched_padding_mask = [] # For Transformer (True = Padding)
+    batched_padding_mask = [] 
 
     for item in batch:
         cur_len = len(item['kg_class_ids'])
         pad_len = max_len - cur_len
         
-        # 1. Pad Class IDs (PAD=0)
-        # [S] -> [Max_S]
+        # 1. IDs
         padded_ids = torch.cat([
             item['kg_class_ids'], 
             torch.zeros(pad_len, dtype=torch.long)
         ])
         batched_class_ids.append(padded_ids)
         
-        # 2. Pad Target Boxes
-        # [S, 4] -> [Max_S, 4]
+        # 2. Weights [NEW]
+        padded_weights = torch.cat([
+            item['kg_class_weights'],
+            torch.zeros(pad_len, dtype=torch.float32)
+        ])
+        batched_class_weights.append(padded_weights)
+        
+        # 3. Boxes
         padded_boxes = torch.cat([
             item['target_boxes'], 
             torch.zeros((pad_len, 4), dtype=torch.float32)
         ])
         batched_target_boxes.append(padded_boxes)
         
-        # 3. Pad Loss Mask
-        # [S] -> [Max_S]
+        # 4. Mask
         padded_loss_mask = torch.cat([
             item['loss_mask'], 
             torch.zeros(pad_len, dtype=torch.float32)
         ])
         batched_loss_mask.append(padded_loss_mask)
         
-        # 4. Create Padding Mask (True where padded)
-        # [Max_S]
+        # 5. Pad Mask
         pad_mask = torch.zeros(max_len, dtype=torch.bool)
         if pad_len > 0:
             pad_mask[cur_len:] = True
@@ -241,10 +259,11 @@ def layout_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     return {
         'input_ids': input_ids, 
         'attention_mask': attention_mask, 
-        'kg_class_ids': torch.stack(batched_class_ids),      # [B, S]
-        'target_boxes': torch.stack(batched_target_boxes),   # [B, S, 4]
-        'loss_mask': torch.stack(batched_loss_mask),         # [B, S]
-        'padding_mask': torch.stack(batched_padding_mask),   # [B, S]
+        'kg_class_ids': torch.stack(batched_class_ids),      
+        'kg_class_weights': torch.stack(batched_class_weights), # [NEW]
+        'target_boxes': torch.stack(batched_target_boxes),   
+        'loss_mask': torch.stack(batched_loss_mask),         
+        'padding_mask': torch.stack(batched_padding_mask),   
         'kg_spatial_matrix': kg_spatial_matrices,
         'kg_vector': kg_vectors,
         'num_boxes': num_boxes

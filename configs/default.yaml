@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-2.0/configs/default.yaml (CRITICAL LOSS WEIGHT MODIFICATION)
+# File: tianyusun1/test2/test2-2.0/configs/default.yaml (FINAL LOGIC-DRIVEN CONFIG)
 
 model:
   # BERT encoder
@@ -12,20 +12,31 @@ model:
   # Output
   num_classes: 9
   
-  # --- DISCRETE BBOX PARAMETERS (NEW) ---
+  # --- Legacy Discrete Parameters (保留以防报错，但不再核心使用) ---
   num_bbox_bins: 1000
   cls_embed_dim: 16
   bbox_embed_dim: 12
-  iou_loss_weight: 10.0     # <<< 巨幅提高 IoU 权重
-  # --------------------------------------
+  # -----------------------------------------------------------
+
+  # === LOSS WEIGHTS (CRITICAL UPDATE) ===
+  # 1. 弱化 GT 监督 (因为标注不可靠)
+  reg_loss_weight: 1.0      # [LOWERED] 从 10.0 降为 1.0
+  iou_loss_weight: 1.0      # [LOWERED] 从 10.0 降为 1.0
+  area_loss_weight: 1.0     # [LOWERED] 从 10.0 降为 1.0
   
-  coord_loss_weight: 5.0    # <<< 降低离散坐标权重
-  reg_loss_weight: 10.0       # <<< 大幅提高回归损失权重
-  cls_loss_weight: 10.0
-  count_loss_weight: 10.0   # <<< 降低计数损失权重
-  area_loss_weight: 10.0    # <<< 提高面积损失权重
+  # 2. 强化 KG 与 常识约束 (这是新的"老师")
+  relation_loss_weight: 5.0 # [NEW] 强约束：必须遵守 KG 的空间关系 (Above/Inside等)
+  overlap_loss_weight: 2.0  # [NEW] 物理约束：惩罚非包含关系的物体重叠
+  size_loss_weight: 2.0     # [NEW] 统计约束：物体越多，框应该越小
+  
+  # Legacy weights (可以保留或设为0)
+  coord_loss_weight: 0.0    
+  cls_loss_weight: 0.0      # Query-Based 不需要分类损失
+  count_loss_weight: 0.0    # Query-Based 不需要计数损失
+
   # Inference
   max_elements: 30
+  
   # Data paths
   xlsx_path: "/home/610-sty/Layout2Paint/dataset/6800poems.xlsx"
   images_dir: "/home/610-sty/Layout2Paint/dataset/6800"
@@ -44,4 +55,3 @@ training:
 
 inference:
   max_output_length: 30
-  # beam_size: 1
