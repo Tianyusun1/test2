@@ -121,13 +121,14 @@ class PoegraphLayoutDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
+# [data/dataset.py]
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         sample = self.data[idx]
         poem = sample['poem']
-        # boxes: List[(cls_id, cx, cy, w, h)] where cls_id is 2.0~10.0
         boxes = sample['boxes'] 
 
-        # 1. 文本编码（使用 BERT tokenizer）
+        # 1. 文本编码
         tokenized = self.tokenizer(
             poem,
             padding='max_length',
@@ -136,110 +137,92 @@ class PoegraphLayoutDataset(Dataset):
             return_tensors='pt'
         )
 
-        # --- NEW: 提取 KG 视觉特征向量 ---
+        # 2. KG 特征提取
         kg_vector = self.pkg.extract_visual_feature_vector(poem)
-        
-        # --- [NEW] 提取 KG 空间关系矩阵 ---
         kg_spatial_matrix = self.pkg.extract_spatial_matrix(poem)
-        # -------------------------------
 
-        # 2. 布局序列：展平为一维 list (核心修改)
+        # 3. 布局处理
         layout_seq_ids = []
+        target_boxes_float = []  # <--- NEW: 存储真实的浮点坐标用于回归损失
         
-        # ===============================================
-        # [NEW] 几何增强 (Geometric Augmentation)
-        # 仅在训练阶段应用 (假设 DataLoader 会在训练时调用此增强)
-        # ===============================================
-        # 50% 的概率应用增强
+        # 几何增强
         apply_aug = np.random.rand() < 0.5 
         
         for cls_id_float, cx, cy, w, h in boxes:
             if apply_aug:
-                # 随机噪声范围: [-0.01, 0.01] (对应 1% 的扰动)
                 noise_magnitude = 0.01 
                 noise = np.random.uniform(-noise_magnitude, noise_magnitude, size=4)
-                
-                # 1. 坐标 (cx, cy) 扰动并钳位到 [0.0, 1.0]
                 cx = np.clip(cx + noise[0], 0.0, 1.0).item()
                 cy = np.clip(cy + noise[1], 0.0, 1.0).item()
-                
-                # 2. 尺寸 (w, h) 扰动并钳位到 [0.01, 1.0] (确保尺寸不为零或负)
                 w = np.clip(w + noise[2], 0.01, 1.0).item()
                 h = np.clip(h + noise[3], 0.01, 1.0).item()
             
-            # --- BBox 离散化 ---
-            # 将 4 个连续坐标 (可能被增强的) 转换为整数 ID (0 - num_bins-1)
+            # 存储无损浮点值 [cx, cy, w, h]
+            target_boxes_float.append([cx, cy, w, h]) 
+
+            # BBox 离散化
             cx_id = self.bbox_tokenizer.tokenize(cx)
             cy_id = self.bbox_tokenizer.tokenize(cy)
             w_id = self.bbox_tokenizer.tokenize(w)
             h_id = self.bbox_tokenizer.tokenize(h)
             
             layout_seq_ids.extend([cls_id_float, cx_id, cy_id, w_id, h_id])
-            # ---------------------------
 
         return {
             'input_ids': tokenized['input_ids'].squeeze(0), 
             'attention_mask': tokenized['attention_mask'].squeeze(0), 
-            # 传递包含 ID 的 float 列表 (在 collate_fn 中转为 LongTensor)
             'layout_seq': layout_seq_ids, 
             'num_boxes': len(boxes),
-            'kg_vector': kg_vector, # <--- NEW: 返回 KG 向量
-            'kg_spatial_matrix': kg_spatial_matrix # <--- NEW: 返回空间矩阵
+            'kg_vector': kg_vector,
+            'kg_spatial_matrix': kg_spatial_matrix,
+            'target_boxes': target_boxes_float # <--- NEW: 返回浮点列表
         }
 
-# ========================
-# Collate Function for DataLoader - 保持不变
-# ========================
 def layout_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     """
-    将变长 layout_seq padding 到 batch 内最大长度
-    并堆叠 kg_vector 和 kg_spatial_matrix。
+    Collate function that handles padding for ids and stacking for float boxes.
     """
     input_ids = torch.stack([item['input_ids'] for item in batch])
     attention_mask = torch.stack([item['attention_mask'] for item in batch])
     num_boxes_list = [item['num_boxes'] for item in batch]
-    
-    # --- NEW: 堆叠 KG 向量 ---
-    # 结果形状: [Batch_Size, 9]
     kg_vectors = torch.stack([item['kg_vector'] for item in batch])
-    
-    # --- [NEW] 堆叠 KG 空间矩阵 ---
-    # 结果形状: [Batch_Size, 9, 9]
     kg_spatial_matrices = torch.stack([item['kg_spatial_matrix'] for item in batch])
-    # ------------------------
 
-    # 找到最大布局长度（以 5 为单位）
+    # 1. Pad Layout IDs (Discrete)
     max_seq_len = max(len(item['layout_seq']) for item in batch)
-    if max_seq_len == 0:
-        max_seq_len = 5 # 至少一个占位
-
-    # padding layout_seq
+    if max_seq_len == 0: max_seq_len = 5
+    
     layout_seqs_padded = []
     layout_masks = []
     
-    # NEW: padding 必须使用 0，因为 0 代表 PAD/无效/背景。
     for item in batch:
         seq = item['layout_seq']
         pad_len = max_seq_len - len(seq)
-        padded_seq = seq + [0.0] * pad_len # 仍然使用 0.0 padding
-        layout_seqs_padded.append(padded_seq)
-
-        # mask: 1 for real, 0 for pad
-        mask = [1.0] * len(seq) + [0.0] * pad_len
-        layout_masks.append(mask)
+        layout_seqs_padded.append(seq + [0.0] * pad_len)
+        layout_masks.append([1.0] * len(seq) + [0.0] * pad_len)
+        
+    # 2. Pad Target Boxes (Continuous Float)
+    # layout_seq 长度是 5 * num_elements, 所以 boxes 数量是 max_seq_len // 5
+    max_num_boxes = max_seq_len // 5
+    target_boxes_padded = []
     
-    # 核心更改：将 layout_seqs 转换为 LongTensor，因为它们现在代表离散 ID
+    for item in batch:
+        boxes = item['target_boxes'] # list of [cx, cy, w, h]
+        pad_count = max_num_boxes - len(boxes)
+        # Pad with zeros
+        padded_boxes = boxes + [[0.0, 0.0, 0.0, 0.0]] * pad_count
+        target_boxes_padded.append(padded_boxes)
+
     return {
         'input_ids': input_ids, 
         'attention_mask': attention_mask, 
-        # 将 float32 转换为 LongTensor，其中 0 代表 PAD
         'layout_seq': torch.tensor(layout_seqs_padded, dtype=torch.long), 
         'layout_mask': torch.tensor(layout_masks, dtype=torch.float32), 
         'num_boxes': torch.tensor(num_boxes_list, dtype=torch.long),
-        'kg_vector': kg_vectors, # <--- NEW: 返回堆叠后的 KG 向量
-        'kg_spatial_matrix': kg_spatial_matrices # <--- NEW: 返回堆叠后的空间矩阵
+        'kg_vector': kg_vectors,
+        'kg_spatial_matrix': kg_spatial_matrices,
+        'target_boxes': torch.tensor(target_boxes_padded, dtype=torch.float32) # <--- NEW: [B, N, 4]
     }
-
 # ========================
 # 简单验证脚本 - 保持不变
 # ========================

@@ -1,3 +1,5 @@
+# File: tianyusun1/test2/test2-2.0/models/kg.py
+
 import torch
 
 class PoetryKnowledgeGraph:
@@ -86,29 +88,49 @@ class PoetryKnowledgeGraph:
         # 格式: (Class_A, Class_B): Relation_ID (表示 A 相对于 B 的关系)
         # ID 对应: 2:mtn, 3:water, 4:ppl, 5:tree, 6:bldg, 7:bridge, 8:flower, 9:bird, 10:animal
         self.static_priors = {
+            # --- 山水基础结构 ---
             # 山 (2) vs 水 (3) -> 山通常作为背景在水"上方"(画面上部)或"围绕"水
-            (2, 3): 1,  # Mountain(2) ABOVE Water(3) (垂直构图常见)
+            (2, 3): 1,  # Mountain(2) ABOVE Water(3)
             
+            # --- 建筑与环境 ---
+            # 建筑 (6) vs 山 (2) -> 庙宇通常在山中
+            (6, 2): 3,  # Building(6) INSIDE Mountain(2)
+            # 建筑 (6) vs 水 (3) -> 水榭在水边
+            (6, 3): 6,  # Building(6) NEAR Water(3)
+            # 建筑 (6) vs 树 (5) -> 房舍旁有树
+            (6, 5): 6,  # Building(6) NEAR Tree(5)
+            # 桥 (7) vs 水 (3) -> 桥在水上
+            (7, 3): 1,  # Bridge(7) ABOVE Water(3)
+
+            # --- 植被与环境 ---
+            # 树 (5) vs 山 (2) -> 树木覆盖在山上
+            (5, 2): 3,  # Tree(5) INSIDE Mountain(2)
+            # 树 (5) vs 水 (3) -> 柳树在岸边
+            (5, 3): 6,  # Tree(5) NEAR Water(3)
+            # 花 (8) vs 树 (5) -> 花树相映
+            (8, 5): 6,  # Flower(8) NEAR Tree(5)
+
+            # --- 人物与环境 (关键补充) ---
+            # 人 (4) vs 桥 (7) -> 人在桥上
+            (4, 7): 5,  # People(4) ON_TOP Bridge(7)
+            # 人 (4) vs 建筑 (6) -> 人在屋旁/屋内
+            (4, 6): 6,  # People(4) NEAR Building(6)
+            # [新增] 人 (4) vs 山 (2) -> 人在山中 (作为背景)
+            (4, 2): 3,  # People(4) INSIDE Mountain(2)
+            # [新增] 人 (4) vs 水 (3) -> 人在水边/船上
+            (4, 3): 6,  # People(4) NEAR Water(3)
+            # [新增] 人 (4) vs 树 (5) -> 人在树下
+            (4, 5): 6,  # People(4) NEAR Tree(5)
+
+            # --- 飞禽走兽 ---
             # 鸟 (9) vs 树 (5)
             (9, 5): 1,  # Bird(9) ABOVE Tree(5)
-            
             # 鸟 (9) vs 山 (2)
-            (9, 2): 3,  # Bird(9) INSIDE Mountain(2) (鸟在山林背景中)
-            
-            # 建筑 (6) vs 山 (2)
-            (6, 2): 3,  # Building(6) INSIDE Mountain(2) (庙宇通常在山中)
-            
-            # 树 (5) vs 山 (2)
-            (5, 2): 3,  # Tree(5) INSIDE Mountain(2) (树木覆盖在山上)
-            
-            # 桥 (7) vs 水 (3)
-            (7, 3): 1,  # Bridge(7) ABOVE Water(3)
-            
-            # 人 (4) vs 桥 (7)
-            (4, 7): 5,  # People(4) ON_TOP Bridge(7)
-            
-            # 人 (4) vs 建筑 (6)
-            (4, 6): 6,  # People(4) NEAR Building(6)
+            (9, 2): 3,  # Bird(9) INSIDE Mountain(2) (在山林背景中)
+            # [新增] 鸟 (9) vs 水 (3) -> 鸥鹭在水上飞
+            (9, 3): 1,  # Bird(9) ABOVE Water(3)
+            # [新增] 鸟 (9) vs 人 (4) -> 鸟在人上方
+            (9, 4): 1,  # Bird(9) ABOVE People(4)
         }
 
     def _init_visual_synonyms(self):
@@ -135,25 +157,29 @@ class PoetryKnowledgeGraph:
     
     def _add_poem_entity_mappings(self):
         """添加诗词实体到视觉实体的映射"""
-        # 山水类
+        # 山水类 (增强了天象词汇作为背景)
         mountain_keywords = ['山', '峰', '峦', '丘', '岭', '崖', '岩', '峰峦', '山岭', '崇山', '峻岭', 
-                             '青山', '远山', '近山', '高山', '云山', '空山', '寒山', '千山', '万壑']
+                             '青山', '远山', '近山', '高山', '云山', '空山', '寒山', '千山', '万壑',
+                             '红日', '落日', '斜阳', '夕阳', '朝阳', '残阳', '云', '彩云', 
+                             '明月', '月', '残月', '新月', '星', '星河'] 
+        
         water_keywords = ['水', '河', '溪', '江', '湖', '海', '泉', '瀑', '涧', '潭', '池', '波', '浪', '流', '潮',
                          '清流', '碧水', '绿水', '秋水', '春水', '流水', '溪流', '江流', '湖水', '河水', '泉水', '瀑布']
         
-        # 人物类
+        # 人物类 (增强了物品暗示)
         people_keywords = ['人', '士', '客', '渔', '樵', '僧', '道', '隐', '夫', '女', '童', '子', '行', '旅', '舟',
-                          '渔人', '樵夫', '隐士', '高僧', '道士', '游人', '旅人', '故人', '仙人', '老翁', '童子', '美人', '佳人']
+                          '渔人', '樵夫', '隐士', '高僧', '道士', '游人', '旅人', '故人', '仙人', '老翁', '童子', '美人', '佳人',
+                          '伞', '笠', '琴', '笛', '箫', '酒', '孤舟', '轻舟', '画舫', '客船'] 
         
         # 植物类
         tree_keywords = ['树', '木', '松', '柏', '柳', '竹', '梅', '枫', '桂', '梧桐', '杨', '槐', '榆', '樟', '藤',
                         '青松', '翠柏', '垂柳', '翠竹', '梅花', '枫树', '桂树', '梧桐树', '老树', '枯树', '绿树', '花树']
         flower_keywords = ['花', '草', '兰', '菊', '荷', '莲', '梅', '桃', '杏', '李', '梨', '樱', '杜鹃',
-                          '牡丹', '荷花', '莲花', '兰花', '菊花', '梅花', '桃花', '杏花', '樱花', '杜鹃花', '水仙', '芦苇', '蒲草']
+                          '牡丹', '荷花', '莲花', '兰花', '菊花', '梅花', '桃花', '杏花', '樱花', '杜鹃花', '水仙', '芦苇', '蒲草', '芳草']
         
         # 建筑类
         building_keywords = ['屋', '楼', '阁', '亭', '台', '寺', '庙', '庵', '观', '宫', '殿', '宅', '院', '房', '舍',
-                            '轩', '榭', '廊', '桥头屋', '茅屋', '草堂', '楼阁', '亭台', '寺庙', '道观', '宫殿', '宅院', '庭院', '水榭']
+                            '轩', '榭', '廊', '桥头屋', '茅屋', '草堂', '楼阁', '亭台', '寺庙', '道观', '宫殿', '宅院', '庭院', '水榭', '柴扉']
         bridge_keywords = ['桥', '石桥', '木桥', '拱桥', '曲桥', '栈桥', '浮桥', '廊桥', '竹桥', '独木桥',
                           '石拱桥', '九曲桥', '风雨桥', '虹桥', '小桥', '长桥', '断桥', '古桥', '木拱桥', '石板桥']
         
@@ -478,6 +504,35 @@ class PoetryKnowledgeGraph:
                         # 使得其他物体(other) 被 山(mtn) 包含
                         # Matrix[other, mtn] = INSIDE
                         relation_matrix[other_idx, mtn_idx] = self.RELATION_IDS['inside']
+
+        # --- [NEW] 规则 C: 舟/船 -> 人(4) 在 水(3) 面上/中 ---
+        boat_words = ['舟', '船', '舫']
+        if any(w in poem_text for w in boat_words):
+            ppl_idx = 4 - 2 # 2
+            water_idx = 3 - 2 # 1
+            if ppl_idx in present_indices and water_idx in present_indices:
+                # 覆盖默认的 NEAR (6)，改为 INSIDE (3) 或 ON_TOP (5)
+                # 认为“舟在水中”更为贴切
+                relation_matrix[ppl_idx, water_idx] = self.RELATION_IDS['inside']
+
+        # --- [NEW] 规则 D: 月/星/日 -> Mountain(2) 在最上方 (Background) ---
+        sky_words = ['月', '星', '日', '阳']
+        if any(w in poem_text for w in sky_words):
+            mtn_idx = 2 - 2 # 0
+            if mtn_idx in present_indices:
+                for other_idx in present_indices:
+                    if other_idx != mtn_idx:
+                        # 山/天象 (2) 在 其他物体 (other) 之上
+                        relation_matrix[mtn_idx, other_idx] = self.RELATION_IDS['above']
+
+        # --- [NEW] 规则 E: 花 + 树名/枝 -> 花(8) 在 树(5) 之中/上 ---
+        flower_on_tree_words = ['枝', '梅', '桃', '杏', '李', '花开']
+        if any(w in poem_text for w in flower_on_tree_words):
+            flower_idx = 8 - 2 # 6
+            tree_idx = 5 - 2 # 3
+            if flower_idx in present_indices and tree_idx in present_indices:
+                # 覆盖默认的 NEAR (6)，改为 INSIDE (3)
+                relation_matrix[flower_idx, tree_idx] = self.RELATION_IDS['inside']
 
         return relation_matrix
 

@@ -1,4 +1,4 @@
-# File: trainers/trainer.py
+# File: tianyusun1/test2/test2-2.0/trainers/trainer.py (FIXED)
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
 import os
@@ -157,6 +157,11 @@ class LayoutTrainer:
                 kg_spatial_matrix = None
                 if 'kg_spatial_matrix' in batch:
                     kg_spatial_matrix = batch['kg_spatial_matrix'].to(self.device)
+
+                # [NEW] 获取真实的浮点坐标 Target (无损 Ground Truth)
+                target_boxes_float = None
+                if 'target_boxes' in batch:
+                    target_boxes_float = batch['target_boxes'].to(self.device)
                 
                 # 获取 num_boxes (真实数量)
                 num_boxes = batch['num_boxes'].to(self.device)
@@ -167,9 +172,11 @@ class LayoutTrainer:
                 )
                 
                 # 3. 计算损失 (接收 7 个返回值)
+                # [MODIFIED] 传递 target_coords_gt=target_boxes_float
                 total_loss_item, cls_loss, coord_loss, reg_loss, iou_loss, count_loss, area_loss = self.model.get_loss( 
                     pred_cls, pred_bbox_ids, pred_coord_float, pred_count, 
-                    layout_seq, layout_mask, num_boxes
+                    layout_seq, layout_mask, num_boxes,
+                    target_coords_gt=target_boxes_float # <<< 传入无损浮点真值
                 )
                 
                 if is_training:

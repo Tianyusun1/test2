@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-cc8b0f0a73b00d0c96a3d267fe297e6b8a7891be/inference/greedy_decode.py
+# File: tianyusun1/test2/test2-2.0/inference/greedy_decode.py (FIXED)
 
 import torch
 import numpy as np
@@ -57,13 +57,19 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements: int = 2
     range_divisor = num_bins - 1
     # --------------------------------
 
-    # --- NEW: 提取 KG 向量 (关键修改) ---
+    # --- NEW: 提取 KG 向量 & 空间矩阵 (关键修改) ---
     # 1. 实例化 KG
     pkg = PoetryKnowledgeGraph() 
+    
     # 2. 提取特征 (原始 9 维 CPU Tensor)
     kg_vector_raw = pkg.extract_visual_feature_vector(poem) 
     # 3. 调整形状并移动到设备 (供模型使用)
     kg_vector = kg_vector_raw.unsqueeze(0).to(device) 
+
+    # 4. [NEW] 提取空间关系矩阵 (原始 9x9 CPU Tensor)
+    kg_spatial_matrix_raw = pkg.extract_spatial_matrix(poem)
+    # 添加 Batch 维度并移动到设备: [1, 9, 9]
+    kg_spatial_matrix = kg_spatial_matrix_raw.unsqueeze(0).to(device)
 
     # NEW: 打印 KG 向量 (用于调试)
     print("\n-------------------- KG DEBUG (Inference) ---------------------")
@@ -104,8 +110,20 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements: int = 2
             layout_embed = model.layout_embedding(generated_cls_ids, generated_bboxes) 
             trg_mask = generate_square_subsequent_mask(current_num_elements, device=device) # [T, T]
             
-            # 使用增强后的 text_features
-            decoder_output = model.layout_decoder(layout_embed, text_features, src_mask, trg_mask)
+            # --- [NEW] 动态构建空间偏置 ---
+            # 利用我们在 model 中提取的 helper 方法
+            # generated_cls_ids 在每一步增长，construct_spatial_bias 会自动处理维度 [1, num_heads, T, T]
+            spatial_bias = model.construct_spatial_bias(generated_cls_ids, kg_spatial_matrix)
+            # ---------------------------
+
+            # 使用增强后的 text_features 和 spatial_bias
+            decoder_output = model.layout_decoder(
+                layout_embed, 
+                text_features, 
+                src_mask, 
+                trg_mask,
+                spatial_bias=spatial_bias # <<< 注入空间偏置!
+            )
             
             # Get predictions for the last element 
             last_output = decoder_output[:, -1, :] 

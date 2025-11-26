@@ -16,14 +16,14 @@ model:
   num_bbox_bins: 1000
   cls_embed_dim: 16
   bbox_embed_dim: 12
-  iou_loss_weight: 150.0     # <<< 巨幅提高 IoU 权重
+  iou_loss_weight: 10.0     # <<< 巨幅提高 IoU 权重
   # --------------------------------------
   
   coord_loss_weight: 5.0    # <<< 降低离散坐标权重
-  reg_loss_weight: 100.0       # <<< 大幅提高回归损失权重
+  reg_loss_weight: 10.0       # <<< 大幅提高回归损失权重
   cls_loss_weight: 10.0
   count_loss_weight: 10.0   # <<< 降低计数损失权重
-  area_loss_weight: 30.0    # <<< 提高面积损失权重
+  area_loss_weight: 10.0    # <<< 提高面积损失权重
   # Inference
   max_elements: 30
   # Data paths

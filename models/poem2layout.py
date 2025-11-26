@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-2.0/models/poem2layout.py (MODIFIED)
+# File: tianyusun1/test2/test2-2.0/models/poem2layout.py (FIXED)
 
 import torch
 import torch.nn as nn
@@ -86,6 +86,47 @@ class Poem2LayoutGenerator(nn.Module):
         
         self.reg_head = nn.Linear(decoder_output_size, 4)
 
+    # --- NEW: 提取出来的空间偏置构建逻辑，供 forward 和 inference 复用 ---
+    def construct_spatial_bias(self, cls_ids, kg_spatial_matrix):
+        """
+        根据当前生成的类别序列和全局空间矩阵构建 Attention Bias。
+        Args:
+            cls_ids: [B, S] 当前序列的类别 ID (原始 2-10, BOS/EOS)
+            kg_spatial_matrix: [B, 9, 9] 知识图谱空间矩阵
+        Returns:
+            spatial_bias: [B, num_heads, S, S] or None
+        """
+        if kg_spatial_matrix is None:
+            return None
+            
+        B, S = cls_ids.shape
+        
+        # 1. 映射 cls_ids (2-10) 到 KG 索引 (0-8)
+        # BOS(0) -> -2, EOS(1) -> -1. 只有 >=0 的才是有效物体
+        map_ids = cls_ids - 2 
+        
+        # 2. 为 gather 准备索引 (Clamp 负值以避免越界，稍后 mask 掉)
+        gather_ids = map_ids.clamp(min=0, max=self.num_element_classes - 1) # [B, S]
+        
+        # 3. Gather 操作
+        b_idx = torch.arange(B, device=cls_ids.device).view(B, 1, 1).expand(-1, S, S)
+        row_idx = gather_ids.view(B, S, 1).expand(-1, -1, S)
+        col_idx = gather_ids.view(B, 1, S).expand(-1, S, -1)
+        
+        # [B, S, S] - 获取每对 Token 之间的关系 ID
+        rel_ids = kg_spatial_matrix[b_idx, row_idx, col_idx] 
+        
+        # 4. Mask 掉无效元素 (BOS/EOS)
+        is_valid_obj = (map_ids >= 0) # [B, S]
+        valid_pair_mask = is_valid_obj.unsqueeze(2) & is_valid_obj.unsqueeze(1) # [B, S, S]
+        rel_ids = rel_ids.masked_fill(~valid_pair_mask, 0) # 0 是 'none' 关系
+        
+        # 5. Embedding & Reshape
+        spatial_bias = self.spatial_bias_embedding(rel_ids) # [B, S, S, num_heads]
+        spatial_bias = spatial_bias.permute(0, 3, 1, 2).contiguous() # [B, num_heads, S, S]
+        
+        return spatial_bias
+
     # **修改: forward 增加 kg_spatial_matrix 参数**
     def forward(self, input_ids, attention_mask, layout_seq, kg_vectors, kg_spatial_matrix=None):
         # layout_seq: [B, S]
@@ -117,48 +158,9 @@ class Poem2LayoutGenerator(nn.Module):
         src_mask = attention_mask.unsqueeze(1).unsqueeze(2) 
 
         # =================================================
-        # [NEW] 构建空间 Attention Bias
+        # [NEW] 构建空间 Attention Bias (调用 helper 方法)
         # =================================================
-        spatial_bias = None
-        if kg_spatial_matrix is not None:
-            # kg_spatial_matrix: [B, 9, 9] (关系 ID)
-            # cls_ids: [B, S] (原始类别 ID 0,1,2-10)
-            
-            # 1. 映射 cls_ids (2-10) 到 KG 索引 (0-8)
-            # BOS(0), EOS(1) 会变成 -2, -1
-            map_ids = cls_ids - 2 
-            
-            # 2. 为 gather 准备索引 (Clamp 负值以避免越界，稍后 mask 掉)
-            gather_ids = map_ids.clamp(min=0, max=self.num_element_classes - 1) # [B, S]
-            
-            # 3. Gather 操作: 构建 [B, S, S] 的关系矩阵
-            # 我们要从 kg_spatial_matrix [B, 9, 9] 中根据 layout 序列的类别抽取关系
-            B, S = cls_ids.shape
-            
-            # 扩展索引以匹配 [B, S, S]
-            # b_idx: 批次索引
-            b_idx = torch.arange(B, device=cls_ids.device).view(B, 1, 1).expand(-1, S, S)
-            # row_idx: Query 元素的类别索引 [B, S, 1] -> [B, S, S]
-            row_idx = gather_ids.view(B, S, 1).expand(-1, -1, S)
-            # col_idx: Key 元素的类别索引 [B, 1, S] -> [B, S, S]
-            col_idx = gather_ids.view(B, 1, S).expand(-1, S, -1)
-            
-            # 查表得到 Token 对 Token 的关系 ID
-            rel_ids = kg_spatial_matrix[b_idx, row_idx, col_idx] # [B, S, S]
-            
-            # 4. Mask 掉无效元素 (BOS/EOS)
-            # 只要 Query 或 Key 是非物体 (map_ids < 0)，关系即为 0 (None)
-            is_valid_obj = (map_ids >= 0) # [B, S]
-            # valid_pair: 只有当两个都是有效物体时，关系才有效
-            valid_pair_mask = is_valid_obj.unsqueeze(2) & is_valid_obj.unsqueeze(1) # [B, S, S]
-            
-            rel_ids = rel_ids.masked_fill(~valid_pair_mask, 0)
-            
-            # 5. 嵌入 bias: [B, S, S] -> [B, S, S, num_heads]
-            spatial_bias = self.spatial_bias_embedding(rel_ids)
-            
-            # 6. 调整形状以适配 Multi-Head Attention: [B, num_heads, S, S]
-            spatial_bias = spatial_bias.permute(0, 3, 1, 2).contiguous()
+        spatial_bias = self.construct_spatial_bias(cls_ids, kg_spatial_matrix)
 
         # 传入 spatial_bias 到解码器
         decoder_output = self.layout_decoder(
@@ -242,7 +244,7 @@ class Poem2LayoutGenerator(nn.Module):
 
         return iou_loss
 
-    def get_loss(self, pred_cls, pred_bbox_ids, pred_coord_float, pred_count, target_layout_seq, target_layout_mask, target_num_boxes):
+    def get_loss(self, pred_cls, pred_bbox_ids, pred_coord_float, pred_count, target_layout_seq, target_layout_mask, target_num_boxes, target_coords_gt=None):
         batch_size, seq_len_decoded = target_layout_seq.shape 
         num_elements_decoded = seq_len_decoded // 5 
 
@@ -263,7 +265,10 @@ class Poem2LayoutGenerator(nn.Module):
             pred_coord_float = pred_coord_float[:, :min_seq_len, :] 
             target_cls_ids = target_cls_ids[:, :min_seq_len] 
             target_bbox_ids = target_bbox_ids[:, :min_seq_len, :] 
-            cls_mask = cls_mask[:, :min_seq_len] 
+            cls_mask = cls_mask[:, :min_seq_len]
+            # [NEW] Handle GT float target truncation
+            if target_coords_gt is not None:
+                target_coords_gt = target_coords_gt[:, :min_seq_len, :]
             
         # 1. Cls Loss
         valid_cls_target_mask = (target_cls_ids >= 1) & (target_cls_ids <= 10) 
@@ -306,9 +311,14 @@ class Poem2LayoutGenerator(nn.Module):
         num_valid_tokens = (cls_mask & valid_coord_target_mask).sum().clamp(min=1) * 4 
         coord_loss = coord_loss / num_valid_tokens
         
-        # 3. Reg Loss
-        target_coord_float = self._detokenize_target_ids(target_bbox_ids) 
-        reg_loss_per_coord = F.smooth_l1_loss(pred_coord_float, target_coord_float.detach(), reduction='none') 
+        # 3. Reg Loss (MODIFIED: Use GT float if available)
+        if target_coords_gt is not None:
+            target_coord_float = target_coords_gt.detach()
+        else:
+            # Fallback for inference/validation if gt not provided
+            target_coord_float = self._detokenize_target_ids(target_bbox_ids) 
+            
+        reg_loss_per_coord = F.smooth_l1_loss(pred_coord_float, target_coord_float, reduction='none') 
         reg_loss_mask = (cls_mask & valid_coord_target_mask).unsqueeze(-1).float() 
         reg_loss = reg_loss_per_coord * reg_loss_mask
         reg_loss = reg_loss.sum() / num_valid_tokens
@@ -320,10 +330,8 @@ class Poem2LayoutGenerator(nn.Module):
             iou_threshold=0.5
         )
 
-        # 5. Area Loss <<< MODIFIED >>>
+        # 5. Area Loss (MODIFIED: Use GT float)
         
-        # NOTE: target_coord_float is already calculated in Section 3 (Reg Loss)
-
         # Calculate target area (w * h)
         target_w = target_coord_float[..., 2]
         target_h = target_coord_float[..., 3]
@@ -335,7 +343,6 @@ class Poem2LayoutGenerator(nn.Module):
         pred_area = pred_w * pred_h 
 
         # Use Smooth L1 to penalize the difference between predicted and target area
-        # Detach target_area as it comes from the discrete path
         area_loss_per_element = F.smooth_l1_loss(pred_area, target_area.detach(), reduction='none') 
 
         # Reuse existing masks for valid elements
@@ -355,6 +362,6 @@ class Poem2LayoutGenerator(nn.Module):
                      (self.reg_loss_weight * reg_loss) + \
                      (self.iou_loss_weight * iou_loss) + \
                      (self.count_loss_weight * count_loss) + \
-                     (self.area_loss_weight * area_loss) # Area Loss is now correctly included
+                     (self.area_loss_weight * area_loss) 
         
         return total_loss, cls_loss, coord_loss, reg_loss, iou_loss, count_loss, area_loss
