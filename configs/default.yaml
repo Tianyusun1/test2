@@ -1,31 +1,31 @@
-# File: tianyusun1/test2/test2-47ecab22ecef994cb8828e0081b43d5e2512f367/configs/default.yaml
+# File: tianyusun1/test2/test2-2.0/configs/default.yaml (CRITICAL LOSS WEIGHT MODIFICATION)
 
 model:
   # BERT encoder
   bert_path: "/home/610-sty/huggingface/bert-base-chinese"
-  hidden_size: 768  # BERT hidden size
+  hidden_size: 768
   # Layout decoder
-  bb_size: 64       
-  decoder_layers: 6       
+  bb_size: 64
+  decoder_layers: 6
   decoder_heads: 8
-  dropout: 0.3      # 保持不变
+  dropout: 0.3
   # Output
-  num_classes: 9    
+  num_classes: 9
   
   # --- DISCRETE BBOX PARAMETERS (NEW) ---
-  num_bbox_bins: 1000       
-  cls_embed_dim: 16         
-  bbox_embed_dim: 12        
-  iou_loss_weight: 35.0     # 保持不变，强力排斥重叠
+  num_bbox_bins: 1000
+  cls_embed_dim: 16
+  bbox_embed_dim: 12
+  iou_loss_weight: 150.0     # <<< 巨幅提高 IoU 权重
   # --------------------------------------
   
-  coord_loss_weight: 10.0    # 保持不变
-  reg_loss_weight: 30.0       # <<< MODIFIED: 从 20.0 提高到 30.0，进一步强调几何精确度
-  cls_loss_weight: 10.0     # 保持不变
-  count_loss_weight: 20.0   # 保持不变
-  area_loss_weight: 10.0    # <<< MODIFIED: 从 0.0 启用并设置为 10.0，惩罚预测面积与真实面积的差异
+  coord_loss_weight: 5.0    # <<< 降低离散坐标权重
+  reg_loss_weight: 100.0       # <<< 大幅提高回归损失权重
+  cls_loss_weight: 10.0
+  count_loss_weight: 10.0   # <<< 降低计数损失权重
+  area_loss_weight: 30.0    # <<< 提高面积损失权重
   # Inference
-  max_elements: 30 
+  max_elements: 30
   # Data paths
   xlsx_path: "/home/610-sty/Layout2Paint/dataset/6800poems.xlsx"
   images_dir: "/home/610-sty/Layout2Paint/dataset/6800"
@@ -36,9 +36,9 @@ model:
 training:
   batch_size: 16
   epochs: 400
-  learning_rate: 0.0001 
+  learning_rate: 0.0001
   warmup_steps: 1000
-  save_every: 50 
+  save_every: 50
   output_dir: "./outputs"
   log_steps: 10
 
