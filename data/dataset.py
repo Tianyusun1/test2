@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-2.0/data/dataset.py (FINAL WEIGHT AWARE + CLEANING)
+# File: tianyusun1/test2/test2-2.0/data/dataset.py (FINAL WEIGHT AWARE + CLEANING + LOCATION GRID)
 
 import os
 import torch
@@ -12,6 +12,8 @@ import numpy as np
 
 # --- 导入知识图谱模型 ---
 from models.kg import PoetryKnowledgeGraph
+# --- [NEW] 导入位置引导信号生成器 ---
+from models.location import LocationSignalGenerator
 # ---------------------------
 
 # 类别定义
@@ -52,6 +54,10 @@ class PoegraphLayoutDataset(Dataset):
         print("Initializing Knowledge Graph...")
         self.pkg = PoetryKnowledgeGraph()
         print("✅ Knowledge Graph initialized.")
+        
+        # [NEW] 初始化位置信号生成器
+        self.location_gen = LocationSignalGenerator()
+        print("✅ Location Signal Generator initialized.")
         
         # 加载 Excel
         df = pd.read_excel(xlsx_path)
@@ -127,6 +133,36 @@ class PoegraphLayoutDataset(Dataset):
             kg_class_ids = [0]
             kg_class_weights = [0.0]
 
+        # === [NEW] 生成位置引导信号 (Location Grids - Stateful) ===
+        # 初始化画布状态 (一张白纸)
+        current_occupancy = torch.zeros((5, 5), dtype=torch.float32)
+        location_grids_list = [] # 临时存储
+        
+        # 遍历生成的 Queries (kg_class_ids)
+        for i, cls_id in enumerate(kg_class_ids):
+            cls_id = int(cls_id)
+            if cls_id == 0: # PAD
+                location_grids_list.append(torch.zeros((5, 5), dtype=torch.float32))
+                continue
+                
+            # Class ID (2-10) -> Matrix Index (0-8)
+            matrix_idx = cls_id - 2
+            
+            # 获取该物体在 KG 中的空间关系
+            # Row: 我对别人的关系; Col: 别人对我的关系
+            spatial_row = kg_spatial_matrix[matrix_idx]  
+            spatial_col = kg_spatial_matrix[:, matrix_idx] 
+            
+            # 调用 location_gen 进行有状态推理
+            # signal: 当前物体的热力图; current_occupancy: 更新后的全局占用图
+            signal, current_occupancy = self.location_gen.infer_stateful_signal(
+                i, spatial_row, spatial_col, current_occupancy
+            )
+            
+            location_grids_list.append(signal)
+            
+        # =======================================================
+
         # 3. GT 对齐与清洗 (Alignment & Cleaning Logic)
         target_boxes = []
         loss_mask = [] # 1.0: 有效GT, 0.0: 无GT或脏数据
@@ -184,20 +220,26 @@ class PoegraphLayoutDataset(Dataset):
         # 限制最大长度
         if len(kg_class_ids) > self.max_layout_length:
             kg_class_ids = kg_class_ids[:self.max_layout_length]
-            kg_class_weights = kg_class_weights[:self.max_layout_length] # [NEW] Trim
+            kg_class_weights = kg_class_weights[:self.max_layout_length] 
             target_boxes = target_boxes[:self.max_layout_length]
             loss_mask = loss_mask[:self.max_layout_length]
+            # [NEW] 同时裁剪 location_grids
+            location_grids_list = location_grids_list[:self.max_layout_length]
+
+        # 转为 Tensor
+        location_grids = torch.stack(location_grids_list) # [T, 5, 5]
 
         return {
             'input_ids': tokenized['input_ids'].squeeze(0), 
             'attention_mask': tokenized['attention_mask'].squeeze(0), 
             'kg_class_ids': torch.tensor(kg_class_ids, dtype=torch.long),
-            'kg_class_weights': torch.tensor(kg_class_weights, dtype=torch.float32), # [NEW]
+            'kg_class_weights': torch.tensor(kg_class_weights, dtype=torch.float32), 
             'target_boxes': torch.tensor(target_boxes, dtype=torch.float32),
             'loss_mask': torch.tensor(loss_mask, dtype=torch.float32),
             'kg_spatial_matrix': kg_spatial_matrix,
             'kg_vector': kg_vector,
-            'num_boxes': torch.tensor(len(gt_boxes), dtype=torch.long)
+            'num_boxes': torch.tensor(len(gt_boxes), dtype=torch.long),
+            'location_grids': location_grids # [NEW] Added to return
         }
 
 def layout_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
@@ -213,10 +255,11 @@ def layout_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     if max_len == 0: max_len = 1
 
     batched_class_ids = []
-    batched_class_weights = [] # [NEW]
+    batched_class_weights = [] 
     batched_target_boxes = []
     batched_loss_mask = []
     batched_padding_mask = [] 
+    batched_location_grids = [] # [NEW]
 
     for item in batch:
         cur_len = len(item['kg_class_ids'])
@@ -229,7 +272,7 @@ def layout_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         ])
         batched_class_ids.append(padded_ids)
         
-        # 2. Weights [NEW]
+        # 2. Weights 
         padded_weights = torch.cat([
             item['kg_class_weights'],
             torch.zeros(pad_len, dtype=torch.float32)
@@ -249,8 +292,17 @@ def layout_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
             torch.zeros(pad_len, dtype=torch.float32)
         ])
         batched_loss_mask.append(padded_loss_mask)
+
+        # 5. [NEW] Location Grids
+        # item['location_grids'] shape: [cur_len, 5, 5]
+        # padding shape: [pad_len, 5, 5]
+        padded_grids = torch.cat([
+            item['location_grids'],
+            torch.zeros((pad_len, 5, 5), dtype=torch.float32)
+        ])
+        batched_location_grids.append(padded_grids)
         
-        # 5. Pad Mask
+        # 6. Pad Mask
         pad_mask = torch.zeros(max_len, dtype=torch.bool)
         if pad_len > 0:
             pad_mask[cur_len:] = True
@@ -260,13 +312,14 @@ def layout_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'input_ids': input_ids, 
         'attention_mask': attention_mask, 
         'kg_class_ids': torch.stack(batched_class_ids),      
-        'kg_class_weights': torch.stack(batched_class_weights), # [NEW]
+        'kg_class_weights': torch.stack(batched_class_weights), 
         'target_boxes': torch.stack(batched_target_boxes),   
         'loss_mask': torch.stack(batched_loss_mask),         
         'padding_mask': torch.stack(batched_padding_mask),   
         'kg_spatial_matrix': kg_spatial_matrices,
         'kg_vector': kg_vectors,
-        'num_boxes': num_boxes
+        'num_boxes': num_boxes,
+        'location_grids': torch.stack(batched_location_grids) # [NEW] [B, T, 5, 5]
     }
 
 if __name__ == "__main__":

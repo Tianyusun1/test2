@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-2.0/models/poem2layout.py (WEIGHT AWARE SIZE LOSS)
+# File: tianyusun1/test2/test2-2.0/models/poem2layout.py (FINAL: WITH GRID ENCODER)
 
 import torch
 import torch.nn as nn
@@ -31,21 +31,32 @@ class Poem2LayoutGenerator(nn.Module):
         # 1. Text Encoder
         self.text_encoder = BertModel.from_pretrained(bert_path)
         
-        # 2. Object Query Embedding
+        # 2. Object Query Embedding (Content)
         self.obj_class_embedding = nn.Embedding(num_classes + 2, bb_size, padding_idx=0)
         
-        # 3. Spatial Bias Embedding
+        # 3. Spatial Bias Embedding (Attention Bias)
         self.num_spatial_relations = 7
         self.spatial_bias_embedding = nn.Embedding(self.num_spatial_relations, decoder_heads)
+
+        # === [NEW] 4. Location Grid Encoder (Position) ===
+        # 输入: 5x5 Flattened Grid (25 dim)
+        # 输出: bb_size (与 Content Embedding 对齐)
+        self.grid_encoder = nn.Sequential(
+            nn.Linear(25, bb_size),
+            nn.ReLU(),
+            nn.Linear(bb_size, bb_size),
+            nn.Dropout(dropout)
+        )
+        # ================================================
         
-        # 4. KG Feature Projection
+        # 5. KG Feature Projection
         self.kg_projection = nn.Sequential(
             nn.Linear(num_classes, hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout)
         )
         
-        # 5. Decoder
+        # 6. Decoder
         self.layout_decoder = LayoutDecoder(
             hidden_size=hidden_size,
             bb_size=bb_size,
@@ -57,7 +68,7 @@ class Poem2LayoutGenerator(nn.Module):
         # Decoder 输出
         decoder_output_size = hidden_size + bb_size
         
-        # 6. Prediction Head
+        # 7. Prediction Head
         self.reg_head = nn.Sequential(
             nn.Linear(decoder_output_size, hidden_size),
             nn.ReLU(),
@@ -89,15 +100,36 @@ class Poem2LayoutGenerator(nn.Module):
         
         return spatial_bias
 
-    def forward(self, input_ids, attention_mask, kg_class_ids, padding_mask, kg_spatial_matrix=None):
+    def forward(self, input_ids, attention_mask, kg_class_ids, padding_mask, 
+                kg_spatial_matrix=None, location_grids=None): # [NEW] 新增参数
         """Query-Based Forward Pass."""
+        
         # 1. Text Encoding
         text_encoded = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state 
 
-        # 2. Query Embedding
-        layout_embed = self.obj_class_embedding(kg_class_ids)
+        # 2. Query Embedding (Content)
+        # kg_class_ids: [B, T] -> [B, T, bb_size]
+        content_embed = self.obj_class_embedding(kg_class_ids)
         
-        # 3. Masks
+        # === [NEW] 3. Grid Embedding Injection (Position) ===
+        if location_grids is not None:
+            # location_grids: [B, T, 5, 5]
+            B, T, H, W = location_grids.shape
+            
+            # Flatten: [B, T, 25]
+            grid_flat = location_grids.view(B, T, -1).to(content_embed.device)
+            
+            # Encode: [B, T, 25] -> [B, T, bb_size]
+            pos_embed = self.grid_encoder(grid_flat)
+            
+            # 核心公式: Layout Query = Content + Position
+            layout_embed = content_embed + pos_embed
+        else:
+            # 如果没有 Grid (比如推理时未提供)，退化为仅 Content
+            layout_embed = content_embed
+        # ====================================================
+        
+        # 4. Masks
         src_mask = attention_mask.unsqueeze(1).unsqueeze(2)
         if padding_mask is not None:
             trg_mask = torch.zeros_like(padding_mask, dtype=torch.float)
@@ -106,10 +138,10 @@ class Poem2LayoutGenerator(nn.Module):
         else:
             trg_mask = None
 
-        # 4. Spatial Bias
+        # 5. Spatial Bias (Attention Bias from KG Matrix)
         spatial_bias = self.construct_spatial_bias(kg_class_ids, kg_spatial_matrix)
 
-        # 5. Decoder
+        # 6. Decoder
         decoder_output = self.layout_decoder(
             layout_embed, 
             text_encoded, 
@@ -118,16 +150,14 @@ class Poem2LayoutGenerator(nn.Module):
             spatial_bias=spatial_bias
         ) 
 
-        # 6. Prediction
+        # 7. Prediction
         pred_boxes = torch.sigmoid(self.reg_head(decoder_output))
         
         return None, None, pred_boxes, None
 
     def get_loss(self, pred_cls, pred_bbox_ids, pred_boxes, pred_count, layout_seq, layout_mask, num_boxes, target_coords_gt=None, kg_spatial_matrix=None, kg_class_weights=None):
         """
-        Args:
-            kg_spatial_matrix: [B, 9, 9] 空间关系矩阵
-            kg_class_weights: [B, S] 物体权重 (1.0=Explicit, 0.5=Implicit) [NEW]
+        计算损失 (保持不变，因为 Grid 只是输入引导，不影响 Loss 计算逻辑)
         """
         loss_mask = layout_mask 
         target_boxes = target_coords_gt
@@ -158,8 +188,7 @@ class Poem2LayoutGenerator(nn.Module):
         # 5. Overlap Penalty
         loss_overlap = self._compute_overlap_loss(pred_boxes, loss_mask, kg_spatial_matrix)
 
-        # 6. Size Prior Loss (Updated with Weights)
-        # [MODIFIED] 传入 kg_class_weights
+        # 6. Size Prior Loss
         loss_size_prior = self._compute_size_loss(pred_boxes, loss_mask, num_boxes, kg_class_weights)
 
         # Total Loss
@@ -174,7 +203,6 @@ class Poem2LayoutGenerator(nn.Module):
                loss_reg, loss_iou, loss_size_prior, loss_area
 
     def _compute_iou_loss(self, pred, target, mask):
-        """计算带 Mask 的 IoU Loss"""
         pred_x1 = pred[..., 0] - pred[..., 2] / 2
         pred_y1 = pred[..., 1] - pred[..., 3] / 2
         pred_x2 = pred[..., 0] + pred[..., 2] / 2
@@ -202,7 +230,6 @@ class Poem2LayoutGenerator(nn.Module):
         return loss.sum() / (mask.sum().clamp(min=1))
 
     def _compute_relation_loss(self, pred_boxes, mask, kg_spatial_matrix):
-        """计算空间关系违反损失"""
         if kg_spatial_matrix is None:
             return torch.tensor(0.0, device=pred_boxes.device)
             
@@ -223,20 +250,17 @@ class Poem2LayoutGenerator(nn.Module):
                     box_a = pred_boxes[b, i]
                     box_b = pred_boxes[b, j]
                     
-                    # 1/5: ABOVE/ON_TOP
-                    if rel_id in [1, 5]:
+                    if rel_id in [1, 5]: # ABOVE / ON_TOP
                         dist = box_a[1] - box_b[1] + 0.05
                         if dist > 0:
                             loss += dist
                             count += 1
-                    # 2: BELOW
-                    elif rel_id == 2:
+                    elif rel_id == 2: # BELOW
                         dist = box_b[1] - box_a[1] + 0.05
                         if dist > 0:
                             loss += dist
                             count += 1
-                    # 3: INSIDE
-                    elif rel_id == 3:
+                    elif rel_id == 3: # INSIDE
                         a_x1, a_y1 = box_a[0]-box_a[2]/2, box_a[1]-box_a[3]/2
                         a_x2, a_y2 = box_a[0]+box_a[2]/2, box_a[1]+box_a[3]/2
                         b_x1, b_y1 = box_b[0]-box_b[2]/2, box_b[1]-box_b[3]/2
@@ -253,7 +277,6 @@ class Poem2LayoutGenerator(nn.Module):
         return loss
 
     def _compute_overlap_loss(self, pred_boxes, mask, kg_spatial_matrix):
-        """惩罚不合理的重叠"""
         loss = torch.tensor(0.0, device=pred_boxes.device)
         B, S, _ = pred_boxes.shape
         count = 0
@@ -304,12 +327,6 @@ class Poem2LayoutGenerator(nn.Module):
         return loss
 
     def _compute_size_loss(self, pred_boxes, mask, num_boxes, weights=None):
-        """
-        尺寸先验 (Weighted): 
-        1. Base Area ~ 0.5 / sqrt(N)
-        2. Element Area ~ Base * Weight (Implicit=0.5 -> Smaller)
-        """
-        # pred_boxes: [B, S, 4], area = w * h
         pred_areas = pred_boxes[..., 2] * pred_boxes[..., 3] # [B, S]
         
         if num_boxes is None:
@@ -317,20 +334,13 @@ class Poem2LayoutGenerator(nn.Module):
         else:
             N = num_boxes.float().clamp(min=1)
             
-        # 1. 计算基准面积 (Shape [B, 1])
         base_expected_area = (0.5 / torch.sqrt(N)).unsqueeze(1) 
         
-        # 2. 结合 KG 权重
         if weights is not None:
-            # weights: [B, S] (1.0 或 0.5)
             target_areas = base_expected_area * weights
         else:
             target_areas = base_expected_area.expand_as(pred_areas)
             
-        # 3. 计算 Element-wise Loss
         loss = F.smooth_l1_loss(pred_areas, target_areas, reduction='none')
-        
-        # 只计算 mask=1 的部分
         loss = (loss * mask).sum() / mask.sum().clamp(min=1)
-        
         return loss

@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-2.0/trainers/trainer.py (FINAL: WEIGHTS + KG PRINT)
+# File: tianyusun1/test2/test2-2.0/trainers/trainer.py (FINAL: WEIGHTS + KG PRINT + LOCATION GRID)
 
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
@@ -144,13 +144,19 @@ class LayoutTrainer:
                 if 'kg_spatial_matrix' in batch:
                     kg_spatial_matrix = batch['kg_spatial_matrix'].to(self.device)
                 
+                # [NEW] 提取 Location Grids (用于 Position Guide)
+                location_grids = None
+                if 'location_grids' in batch:
+                    location_grids = batch['location_grids'].to(self.device)
+                
                 # 2. 前向传播
                 _, _, pred_boxes, _ = self.model(
                     input_ids=input_ids, 
                     attention_mask=attention_mask, 
                     kg_class_ids=kg_class_ids, 
                     padding_mask=padding_mask, 
-                    kg_spatial_matrix=kg_spatial_matrix
+                    kg_spatial_matrix=kg_spatial_matrix,
+                    location_grids=location_grids # [NEW] 传入位置网格
                 )
                 
                 # 3. 计算损失
