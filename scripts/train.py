@@ -1,4 +1,4 @@
-# File: scripts/train.py
+# File: tianyusun1/test2/test2-4.0/scripts/train.py
 
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
@@ -109,6 +109,7 @@ def main():
     # ---------------------------
 
     # 3. Init model (传入所有损失权重，包括新增的 Reg, Cls, Count, Area)
+    print(f"Initializing model with latent_dim={model_config.get('latent_dim', 32)}...")
     model = Poem2LayoutGenerator(
         bert_path=model_config['bert_path'],
         num_classes=num_element_classes, # 实际元素类别数 (9)
@@ -121,6 +122,10 @@ def main():
         decoder_layers=model_config['decoder_layers'],
         decoder_heads=model_config['decoder_heads'],
         dropout=model_config['dropout'],
+        
+        # === [NEW] 传入 CVAE 参数 ===
+        latent_dim=model_config.get('latent_dim', 32), # 默认为 32
+        
         # --- 传入所有损失权重 ---
         coord_loss_weight=model_config['coord_loss_weight'],
         iou_loss_weight=model_config.get('iou_loss_weight', 1.0), 

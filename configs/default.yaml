@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-2.0/configs/default.yaml (FINAL LOGIC-DRIVEN CONFIG)
+# File: tianyusun1/test2/test2-4.0/configs/default.yaml (V4.3: OPTIMIZED CURRICULUM CONFIG)
 
 model:
   # BERT encoder
@@ -12,21 +12,31 @@ model:
   # Output
   num_classes: 9
   
+  # === [NEW] CVAE Parameters ===
+  latent_dim: 32  # [NEW] 隐变量维度，决定了“想象力”的空间大小
+  
   # --- Legacy Discrete Parameters (保留以防报错，但不再核心使用) ---
   num_bbox_bins: 1000
   cls_embed_dim: 16
   bbox_embed_dim: 12
   # -----------------------------------------------------------
 
-  # === LOSS WEIGHTS (CRITICAL UPDATE) ===
-  # 1. 弱化 GT 监督 (因为标注不可靠)
-  reg_loss_weight: 1.0      # [LOWERED] 从 10.0 降为 1.0
-  iou_loss_weight: 1.0      # [LOWERED] 从 10.0 降为 1.0
-  area_loss_weight: 1.0     # [LOWERED] 从 10.0 降为 1.0
+  # === LOSS WEIGHTS (INITIAL VALUES FOR CURRICULUM) ===
+  # 注意：trainer.py 的双重课程学习策略会动态调整这些权重。
+  # 这里的设定值对应课程的第一阶段（0-100 Epoch）：强逻辑，弱回归。
   
-  # 2. 强化 KG 与 常识约束 (这是新的"老师")
-  relation_loss_weight: 5.0 # [NEW] 强约束：必须遵守 KG 的空间关系 (Above/Inside等)
-  overlap_loss_weight: 2.0  # [NEW] 物理约束：惩罚非包含关系的物体重叠
+  # 1. 弱化 GT 监督 (初始阶段)
+  reg_loss_weight: 1.0      # [CURRICULUM START] 初始低权重，后期动态升至 5.0
+  iou_loss_weight: 1.0      # [LOWERED] 保持较低，避免初期干扰逻辑学习
+  area_loss_weight: 1.0     
+  
+  # 2. 强化 KG 与 常识约束
+  relation_loss_weight: 5.0 # [CURRICULUM START] 初始高权重，后期动态降至 3.0 (保底逻辑)
+  
+  # [MODIFIED V4.3] 提升初始重叠惩罚
+  # 原为 2.0，现提升至 3.0，配合 Trainer 后期动态增加至 5.0+，强力解决物体堆叠问题。
+  overlap_loss_weight: 3.0  
+  
   size_loss_weight: 2.0     # [NEW] 统计约束：物体越多，框应该越小
   
   # Legacy weights (可以保留或设为0)
@@ -52,6 +62,8 @@ training:
   save_every: 50
   output_dir: "./outputs"
   log_steps: 10
+  # [NEW] 增加可视化频率配置，方便调试
+  visualize_every: 1
 
 inference:
   max_output_length: 30

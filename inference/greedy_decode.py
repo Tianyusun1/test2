@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-2.0/inference/greedy_decode.py (V4.1: FULLY PARAMETERIZED DIVERSITY)
+# File: tianyusun1/test2/test2-4.0/inference/greedy_decode.py (V4.2: CVAE COMPATIBLE)
 
 import torch
 import numpy as np
@@ -18,20 +18,22 @@ except ImportError:
     LocationSignalGenerator = None
 # -----------------
 
-# [MODIFIED] 增加 mode 和 top_k 参数，默认值为 'greedy' 以保持向后兼容
 def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, device='cuda', mode='greedy', top_k=3):
     """
-    Query-Based decoding with Location Guidance:
+    Query-Based decoding with Location Guidance & CVAE Diversity.
+    
     1. Use KG to determine *what* objects are in the poem (Queries).
     2. Use LocationGenerator to determine *roughly where* they should be (Grid Signal).
-    3. Use Model to determine *exactly where* they are (Layout).
+    3. Use Model (CVAE Decoder) to determine *exactly where* they are.
+       - Since target_boxes is NOT provided, the model samples latent 'z' from Prior N(0, I).
+       - This introduces diversity: calling this function multiple times yields different layouts.
     
     Args:
-        model: Trained Poem2LayoutGenerator.
+        model: Trained Poem2LayoutGenerator (V4.2+).
         tokenizer: BertTokenizer.
         poem: Input string.
-        mode: 'greedy' or 'sample'.
-        top_k: Top-K sampling parameter.
+        mode: 'greedy' or 'sample' (Controls LocationGenerator behavior).
+        top_k: Top-K sampling parameter (for LocationGenerator).
     Returns:
         layout: List of (cls_id, cx, cy, w, h).
     """
@@ -47,7 +49,7 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, de
     
     # [NEW] 实例化位置生成器 (使用 8x8 Grid)
     if LocationSignalGenerator is not None:
-        location_gen = LocationSignalGenerator(grid_size=8) # [MODIFIED] 8x8
+        location_gen = LocationSignalGenerator(grid_size=8)
     else:
         location_gen = None
     
@@ -75,7 +77,7 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, de
     
     if location_gen is not None:
         # 初始化画布状态 (8x8)
-        current_occupancy = torch.zeros((8, 8), dtype=torch.float32) # [MODIFIED] 8x8
+        current_occupancy = torch.zeros((8, 8), dtype=torch.float32)
         grids_list = []
         
         for i, cls_id in enumerate(kg_class_ids):
@@ -85,7 +87,7 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, de
             row = kg_spatial_matrix_raw[matrix_idx]
             col = kg_spatial_matrix_raw[:, matrix_idx]
             
-            # [MODIFIED] 使用传入的 mode 和 top_k 参数
+            # [MODIFIED] 使用传入的 mode 和 top_k 参数控制 Grid 的随机性
             signal, current_occupancy = location_gen.infer_stateful_signal(
                 i, row, col, current_occupancy, 
                 mode=mode, top_k=top_k 
@@ -106,14 +108,16 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, de
     
     # 4. 单次前向传播 (One-Shot Prediction)
     with torch.no_grad():
-        # 模型返回: (None, None, pred_boxes, None)
+        # [CVAE Update] 
+        # Model returns: mu, logvar, pred_boxes, decoder_output
+        # We implicitly pass target_boxes=None, triggering z ~ N(0, 1) sampling inside model.
         _, _, pred_boxes, _ = model(
             input_ids=input_ids, 
             attention_mask=attention_mask, 
             kg_class_ids=kg_class_tensor, 
             padding_mask=padding_mask, 
             kg_spatial_matrix=kg_spatial_matrix,
-            location_grids=location_grids_tensor # [NEW] 传入 Grid (8x8)
+            location_grids=location_grids_tensor
         )
         
     # 5. 格式化输出

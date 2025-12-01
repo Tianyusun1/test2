@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-2.0/data/dataset.py (V4.0: ADAPTED FOR 8x8 GRID)
+# File: tianyusun1/test2/test2-4.0/data/dataset.py (V4.6: ENHANCED AUGMENTATION)
 
 import os
 import torch
@@ -9,6 +9,7 @@ from torch.utils.data import Dataset
 from transformers import BertTokenizer
 from typing import List, Tuple, Dict, Optional
 import numpy as np 
+import random # [NEW]
 
 # --- 导入知识图谱模型 ---
 from models.kg import PoetryKnowledgeGraph
@@ -176,6 +177,10 @@ class PoegraphLayoutDataset(Dataset):
             if cid not in gt_dict: gt_dict[cid] = []
             gt_dict[cid].append([cx, cy, w, h])
 
+        # [NEW] 全局数据增强决策 (Flip Augmentation)
+        # 50% 概率水平翻转
+        do_flip = random.random() < 0.5
+        
         # 遍历 KG 要求的每个物体
         for k_cls in kg_class_ids:
             k_cls = int(k_cls)
@@ -204,7 +209,14 @@ class PoegraphLayoutDataset(Dataset):
                 # ===========================
                 
                 # [几何增强]
-                noise = np.random.uniform(-0.01, 0.01, size=4)
+                # 1. Flip (如果触发)
+                # cx -> 1.0 - cx
+                if do_flip:
+                    box[0] = 1.0 - box[0]
+                
+                # 2. Jitter (微小抖动)
+                # 稍微加大一点抖动范围 (-0.02 ~ 0.02)
+                noise = np.random.uniform(-0.02, 0.02, size=4)
                 box_aug = [
                     np.clip(box[0] + noise[0], 0.0, 1.0),
                     np.clip(box[1] + noise[1], 0.0, 1.0),
@@ -229,6 +241,12 @@ class PoegraphLayoutDataset(Dataset):
 
         # 转为 Tensor
         location_grids = torch.stack(location_grids_list) # [T, 8, 8]
+        
+        # [注意] location_grids 也要 Flip!
+        # Grid 是 8x8 的 Heatmap，水平翻转意味着在 dim=2 (Width) 上翻转
+        if do_flip:
+            # torch.flip(input, dims)
+            location_grids = torch.flip(location_grids, dims=[2])
 
         return {
             'input_ids': tokenized['input_ids'].squeeze(0), 
