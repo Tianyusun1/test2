@@ -1,70 +1,136 @@
-# File: tianyusun1/test2/test2-cc8b0f0a73b00d0c96a3d267fe297e6b8a7891be/models/poem2layout.py
+# File: tianyusun1/test2/test2-2.0/models/poem2layout.py (V4.0: LEARNABLE PRIORS + GATED FUSION + 8x8 GRID)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BertModel
-from .embedding import PoemLayoutEmbedding
 from .decoder import LayoutDecoder
 
+# === [NEW] 1. 门控融合模块 ===
+class GatedFusion(nn.Module):
+    """
+    动态融合 Content Features 和 Position Features。
+    F_final = alpha * F_content + (1 - alpha) * F_pos
+    其中 alpha 是由输入动态决定的门控值 (0~1)。
+    """
+    def __init__(self, hidden_size):
+        super().__init__()
+        # 门控网络：输入 concat(content, pos)，输出 1 个 scalar
+        self.gate_net = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1),
+            nn.Sigmoid()
+        )
+        self.norm = nn.LayerNorm(hidden_size)
+
+    def forward(self, content, pos):
+        # content, pos: [B, T, hidden_size]
+        combined = torch.cat([content, pos], dim=-1)
+        alpha = self.gate_net(combined) # [B, T, 1]
+        
+        fused = alpha * content + (1 - alpha) * pos
+        return self.norm(fused)
+
+# === [NEW] 2. 可学习关系先验网络 ===
+class RelationPriorNet(nn.Module):
+    """
+    从 KG 关系矩阵中直接学习位置编码，而不只是依赖手工 Grid。
+    输入：当前物体与其他物体的关系 ID 列表
+    输出：该物体隐含的位置 Embedding
+    """
+    def __init__(self, num_relations, embedding_dim, hidden_size):
+        super().__init__()
+        self.rel_embedding = nn.Embedding(num_relations, embedding_dim, padding_idx=0)
+        # 聚合器：将一个物体与其他所有物体的关系特征聚合
+        self.aggregator = nn.Sequential(
+            nn.Linear(embedding_dim, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size) 
+        )
+        
+    def forward(self, kg_spatial_matrix):
+        """
+        Args:
+            kg_spatial_matrix: [B, S, S] 关系矩阵 (LongTensor)
+        Returns:
+            learned_pos: [B, S, hidden_size]
+        """
+        # 1. Embed 关系: [B, S, S] -> [B, S, S, dim]
+        rels = self.rel_embedding(kg_spatial_matrix)
+        
+        # 2. 聚合 (Aggregation)
+        # 对于物体 i (Row i)，它与所有 j 的关系共同决定了它的位置
+        # 例如：i above j, i inside k -> i 应该在上方且被包含
+        # 对最后两个维度 (S, dim) 进行 Mean Pooling，得到 [B, S, dim]
+        aggregated = rels.mean(dim=2) 
+        
+        # 3. 映射到 Hidden Size
+        learned_pos = self.aggregator(aggregated)
+        return learned_pos
+
+# === 主模型更新 ===
 class Poem2LayoutGenerator(nn.Module):
-    # num_classes: 实际的布局元素类别数 (例如：9)
-    # **修改 1: 增加 area_loss_weight 参数 (修复 TypeError)**
-    def __init__(self, bert_path: str, num_classes: int, num_bbox_bins: int, bbox_embed_dim: int, hidden_size: int = 768, bb_size: int = 64, decoder_layers: int = 4, decoder_heads: int = 8, dropout: float = 0.1, coord_loss_weight: float = 1.0, iou_loss_weight: float = 0.1, reg_loss_weight: float = 1.0, cls_loss_weight: float = 1.0, count_loss_weight: float = 1.0, area_loss_weight: float = 1.0, class_weights: torch.Tensor = None): # <<< NEW: 增加 area_loss_weight
+    def __init__(self, bert_path: str, num_classes: int, hidden_size: int = 768, bb_size: int = 64, 
+                 decoder_layers: int = 4, decoder_heads: int = 8, dropout: float = 0.1, 
+                 reg_loss_weight: float = 1.0, iou_loss_weight: float = 1.0, area_loss_weight: float = 1.0,
+                 relation_loss_weight: float = 5.0,  # 关系约束权重
+                 overlap_loss_weight: float = 2.0,   # 重叠惩罚权重
+                 size_loss_weight: float = 2.0,      # 尺寸先验权重
+                 **kwargs): 
         super(Poem2LayoutGenerator, self).__init__()
         
-        self.num_element_classes = num_classes 
-        self.num_bbox_bins = num_bbox_bins 
-        self.bbox_embed_dim = bbox_embed_dim 
+        self.num_element_classes = num_classes # 9
         self.hidden_size = hidden_size
         self.bb_size = bb_size
-        self.coord_loss_weight = coord_loss_weight
+        
+        # Loss weights
+        self.reg_loss_weight = reg_loss_weight
         self.iou_loss_weight = iou_loss_weight
-        self.reg_loss_weight = reg_loss_weight 
-        self.cls_loss_weight = cls_loss_weight # <<<< 存储 cls_loss_weight
-        self.count_loss_weight = count_loss_weight # <<<< 存储 count_loss_weight
-        self.area_loss_weight = area_loss_weight # <<< NEW: 存储 area_loss_weight
+        self.area_loss_weight = area_loss_weight
+        self.relation_loss_weight = relation_loss_weight
+        self.overlap_loss_weight = overlap_loss_weight
+        self.size_loss_weight = size_loss_weight
         
-        if class_weights is not None:
-            self.register_buffer('class_weights', class_weights)
-        else:
-            self.class_weights = None
-
-        # Special tokens: BOS (0), EOS (1)
-        self.bos_token_id = 0
-        self.eos_token_id = 1
-        total_vocab_size = self.num_element_classes + 2 
-        
+        # 1. Text Encoder
         self.text_encoder = BertModel.from_pretrained(bert_path)
         
-        # --- NEW: KG 特征投影层 ---
-        # 将 9维 的视觉向量投影到 BERT 的 hidden_size (768)
-        # num_element_classes = 9
+        # 2. Object Query Embedding (Content)
+        self.obj_class_embedding = nn.Embedding(num_classes + 2, bb_size, padding_idx=0)
+        
+        # 3. Spatial Bias Embedding (Attention Bias)
+        self.num_spatial_relations = 7
+        self.spatial_bias_embedding = nn.Embedding(self.num_spatial_relations, decoder_heads)
+
+        # === [MODIFIED] 4. Hybrid Position Encoders ===
+        # A. 手工 Grid Encoder (8x8 -> 64)
+        self.grid_encoder = nn.Sequential(
+            nn.Linear(64, bb_size), # [MODIFIED] 25 -> 64
+            nn.ReLU(),
+            nn.Linear(bb_size, bb_size),
+            nn.Dropout(dropout)
+        )
+        
+        # B. [NEW] 可学习先验网络 (Relation -> Position)
+        # 让模型自己去理解 "Above" 到底意味着什么样的位置 Embedding
+        self.learnable_prior_net = RelationPriorNet(
+            num_relations=self.num_spatial_relations,
+            embedding_dim=32,
+            hidden_size=bb_size # 输出维度与 bb_size 对齐
+        )
+        
+        # C. [NEW] 门控融合
+        self.fusion_gate = GatedFusion(bb_size)
+        # ==============================================
+        
+        # 5. KG Feature Projection
         self.kg_projection = nn.Sequential(
-            nn.Linear(self.num_element_classes, hidden_size),
+            nn.Linear(num_classes, hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout)
         )
-        # -------------------------
         
-        # **修改 2: 新增 数量预测头 (Count Prediction Head)**
-        self.count_head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, 1) # 输出一个标量，预测数量
-        )
-        
-        # 实例化 Layout Embedding，传入所有 BBox 相关的配置参数
-        self.layout_embedding = PoemLayoutEmbedding(
-            total_vocab_size=total_vocab_size, 
-            num_bbox_bins=num_bbox_bins,
-            bb_size=bb_size,
-            cls_embed_dim=bb_size - 4 * bbox_embed_dim, # 动态计算类别嵌入维度
-            bbox_embed_dim=bbox_embed_dim
-        )
-        
-        # NOTE: decoder_layers, decoder_heads, dropout 会从 config 传入新值 (如 6, 8, 0.2)
+        # 6. Decoder
         self.layout_decoder = LayoutDecoder(
             hidden_size=hidden_size,
             bb_size=bb_size,
@@ -73,309 +139,303 @@ class Poem2LayoutGenerator(nn.Module):
             dropout=dropout
         )
 
+        # Decoder 输出
         decoder_output_size = hidden_size + bb_size
         
-        # 分类头仍预测布局元素的数量 (9 类)
-        # self.cls_head = nn.Linear(decoder_output_size, self.num_element_classes) # 原代码
-        self.cls_head = nn.Linear(decoder_output_size, self.num_element_classes + 1) # <<< MODIFIED: 预测 10 类 (9元素 + EOS)
-        
-        # 4 个 BBox 坐标的分类头 (用于 L_coord)
-        self.cx_head = nn.Linear(decoder_output_size, self.num_bbox_bins)
-        self.cy_head = nn.Linear(decoder_output_size, self.num_bbox_bins)
-        self.w_head = nn.Linear(decoder_output_size, self.num_bbox_bins)
-        self.h_head = nn.Linear(decoder_output_size, self.num_bbox_bins)
-        
-        # **新增：4 个 BBox 坐标的连续回归头 (用于 L_reg)**
-        self.reg_head = nn.Linear(decoder_output_size, 4)
+        # 7. Prediction Head
+        self.reg_head = nn.Sequential(
+            nn.Linear(decoder_output_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 4)
+        )
 
-    # **修改 3: forward 返回 pred_cls, pred_bbox_ids, pred_coord_float, pred_count**
-    def forward(self, input_ids, attention_mask, layout_seq, kg_vectors):
-        # layout_seq: [B, S] 现包含整数 ID (类别 ID, cx_id, cy_id, w_id, h_id)
-        batch_size, seq_len = layout_seq.shape
-        if seq_len % 5 != 0:
-            raise ValueError(f"Layout sequence length {seq_len} must be a multiple of 5.")
-        num_elements = seq_len // 5
-
-        # 1. 获取 BERT 文本特征 [B, L_text, H]
-        text_encoded = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state 
-        
-        # **修改 4: 数量预测**
-        # 使用 [CLS] token 的输出 (text_encoded[:, 0, :]) 进行数量预测
-        pred_count = self.count_head(text_encoded[:, 0, :]) # [B, 1]
-
-        # 2. --- NEW: 注入 KG 特征 ---
-        # kg_vectors: [B, 9] -> projection -> [B, H]
-        kg_feat = self.kg_projection(kg_vectors) 
-        
-        # 将 KG 特征加到文本特征的每一个 token 上 (Broadcasting)
-        # [B, L_text, H] + [B, 1, H] -> [B, L_text, H]
-        text_encoded = text_encoded + kg_feat.unsqueeze(1)
-        # ---------------------------
-
-        # Reshape layout_seq to separate cls and 4 BBox token IDs (all Long)
-        reshaped_seq = layout_seq.view(batch_size, num_elements, 5)
-        cls_ids = reshaped_seq[:, :, 0].long()      # [B, num_elements]
-        bbox_ids = reshaped_seq[:, :, 1:5].long()   # [B, num_elements, 4]
-
-        # 使用 BBox IDs 进行嵌入
-        layout_embed = self.layout_embedding(cls_ids, bbox_ids) # [B, num_elements, bb_size]
-
-        trg_mask = self.generate_square_subsequent_mask(num_elements).to(layout_embed.device)
-        src_mask = attention_mask.unsqueeze(1).unsqueeze(2) 
-
-        decoder_output = self.layout_decoder(layout_embed, text_encoded, src_mask, trg_mask) # [B, num_elements, H + bb_size]
-
-        # Cls prediction
-        pred_cls = self.cls_head(decoder_output) # [B, num_elements, num_element_classes + 1]
-        
-        # 4 BBox Token Predictions (Classification for L_coord)
-        pred_cx_id = self.cx_head(decoder_output) # [B, T, num_bbox_bins]
-        pred_cy_id = self.cy_head(decoder_output)
-        pred_w_id = self.w_head(decoder_output)
-        pred_h_id = self.h_head(decoder_output)
-        
-        # 堆叠预测结果，用于损失计算
-        # 形状: [B, T, 4, num_bbox_bins]
-        pred_bbox_ids = torch.stack([pred_cx_id, pred_cy_id, pred_w_id, pred_h_id], dim=2) 
-        
-        # **新增：连续坐标预测 (用于 L_reg 和 L_iou)**
-        # 使用 sigmoid 激活函数将输出钳位到 [0, 1] 范围
-        pred_coord_float = torch.sigmoid(self.reg_head(decoder_output)) # [B, num_elements, 4]
-
-        # **修改 5: 返回值增加 pred_count**
-        return pred_cls, pred_bbox_ids, pred_coord_float, pred_count
-
-    def generate_square_subsequent_mask(self, sz):
-        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-        return mask
-
-    # **新增: 用于将目标 BBox Token ID 反量化为 float 坐标的辅助函数**
-    def _detokenize_target_ids(self, target_bbox_ids: torch.Tensor) -> torch.Tensor:
-        """
-        将目标的 BBox Token ID 转换回连续的浮点坐标。
-        目标 ID: [B, S, 4] (0-999)
-        """
-        num_bins = self.num_bbox_bins
-        range_divisor = num_bins - 1
-        
-        # 0.0 代表 PAD 或最小 bin 的起始值
-        detok_boxes = target_bbox_ids.float() / range_divisor
-        
-        return detok_boxes
-
-    # **修改: _detokenize_pred_ids 现在使用 pred_bbox_ids (logits) 而非 pred_coord_float**
-    def _detokenize_pred_ids(self, pred_bbox_ids: torch.Tensor) -> torch.Tensor:
-        """
-        将预测的 BBox Token Logits 转换回连续的浮点坐标。
-        该函数仅用于 IoU 计算，但我们现在优先使用 pred_coord_float，所以此函数不再被 get_loss 直接使用，但保留以防万一。
-        """
-        # 1. 找到概率最高的 bin ID
-        # pred_bbox_ids 形状为 [B, S, 4, num_bins]
-        pred_ids = pred_bbox_ids.argmax(dim=-1) # [B, S, 4]
-        
-        # 2. 反量化公式
-        num_bins = self.num_bbox_bins
-        range_divisor = num_bins - 1
-        
-        detok_boxes = pred_ids.float() / range_divisor
-        
-        return detok_boxes
-
-    def _compute_iou_loss(self, pred_boxes: torch.Tensor, valid_mask: torch.Tensor, iou_threshold: float = 0.5):
-        """
-        IoU 排斥损失计算。
-        NOTE: pred_boxes 必须是浮点值 (detokenized 或直接回归)。
-        """
-        B, S, _ = pred_boxes.shape
-        
-        # 1. Convert cx,cy,w,h to xmin,ymin,xmax,ymax
-        w_half = pred_boxes[..., 2:3] / 2
-        h_half = pred_boxes[..., 3:4] / 2
-        boxes = torch.cat([
-            pred_boxes[..., 0:1] - w_half,  # xmin
-            pred_boxes[..., 1:2] - h_half,  # ymin
-            pred_boxes[..., 0:1] + w_half,  # xmax
-            pred_boxes[..., 1:2] + h_half   # ymax
-        ], dim=-1).clamp(0., 1.) # [B, S, 4]
-
-        # 2. Compute pairwise IoU
-        # ... (IoU 计算逻辑保持不变) ...
-        area = (boxes[..., 2] - boxes[..., 0]) * (boxes[..., 3] - boxes[..., 1]) # [B, S]
-        area_i = area.unsqueeze(2) # [B, S, 1]
-        area_j = area.unsqueeze(1) # [B, 1, S]
-        
-        # Intersections
-        xmin_max = torch.max(boxes.unsqueeze(2)[..., 0], boxes.unsqueeze(1)[..., 0]) # [B, S, S]
-        ymin_max = torch.max(boxes.unsqueeze(2)[..., 1], boxes.unsqueeze(1)[..., 1]) # [B, S, S]
-        xmax_min = torch.min(boxes.unsqueeze(2)[..., 2], boxes.unsqueeze(1)[..., 2]) # [B, S, S]
-        ymax_min = torch.min(boxes.unsqueeze(2)[..., 3], boxes.unsqueeze(1)[..., 3]) # [B, S, S]
-
-        inter_w = (xmax_min - xmin_max).clamp(min=0) # [B, S, S]
-        inter_h = (ymax_min - ymin_max).clamp(min=0) # [B, S, S]
-        intersection = inter_w * inter_h # [B, S, S]
-
-        # Union
-        union = area_i + area_j - intersection # [B, S, S]
-
-        # IoU
-        iou = intersection / (union + 1e-6) # [B, S, S]
-        
-        # 3. Apply mask and calculate penalty
-        valid_mask_i = valid_mask.unsqueeze(2) # [B, S, 1]
-        valid_mask_j = valid_mask.unsqueeze(1) # [B, 1, S]
-        pairwise_mask = valid_mask_i & valid_mask_j # [B, S, S]
-        
-        # Mask out self-IoU (diagonal: i == j) which is always 1.
-        diag_mask = torch.eye(S, device=iou.device).bool().unsqueeze(0).expand(B, -1, -1) # [B, S, S]
-        pairwise_mask = pairwise_mask & (~diag_mask) 
-        
-        # Apply IoU Repulsion Penalty: penalty = max(0, IoU - threshold)^2
-        penalty = (iou - iou_threshold).clamp(min=0.) ** 2 # [B, S, S]
-        
-        # Apply the final mask
-        masked_penalty = penalty * pairwise_mask.float()
-        
-        # Average over all non-diagonal, valid pairs
-        num_valid_pairs = pairwise_mask.sum().clamp(min=1) 
-        iou_loss = masked_penalty.sum() / num_valid_pairs
-
-        return iou_loss
-
-    # **修改 6: get_loss 接收 pred_count 和 target_num_boxes**
-    def get_loss(self, pred_cls, pred_bbox_ids, pred_coord_float, pred_count, target_layout_seq, target_layout_mask, target_num_boxes): # <<<< 增加参数
-        """
-        Calculates the combined Hybrid loss for class prediction, BBox token prediction, BBox continuous regression, and Count prediction.
-        """
-        batch_size, seq_len_decoded = target_layout_seq.shape 
-        num_elements_decoded = seq_len_decoded // 5 
-
-        # --- Reshape target sequence and mask ---
-        reshaped_target = target_layout_seq.view(batch_size, num_elements_decoded, 5)
-        
-        # Target values are now token IDs (LongTensor)
-        target_cls_ids = reshaped_target[:, :, 0].long()     # [B, S] (2-10)
-        target_bbox_ids = reshaped_target[:, :, 1:5].long()  # [B, S, 4] (0-999)
-
-        reshaped_mask = target_layout_mask.view(batch_size, num_elements_decoded, 5)
-        cls_mask = reshaped_mask[:, :, 0].bool() # [B, S]
-
-        # --- Defensive: Align sequence lengths ---
-        pred_seq_len = pred_cls.size(1)
-        target_seq_len = target_cls_ids.size(1)
-
-        if pred_seq_len != target_seq_len:
-            min_seq_len = min(pred_seq_len, target_seq_len)
-            pred_cls = pred_cls[:, :min_seq_len, :] 
-            pred_bbox_ids = pred_bbox_ids[:, :min_seq_len, :, :] # [B, min_S, 4, num_bins]
-            pred_coord_float = pred_coord_float[:, :min_seq_len, :] # **截断连续预测**
-            target_cls_ids = target_cls_ids[:, :min_seq_len] 
-            target_bbox_ids = target_bbox_ids[:, :min_seq_len, :] # [B, min_S, 4]
-            cls_mask = cls_mask[:, :min_seq_len] 
+    def construct_spatial_bias(self, cls_ids, kg_spatial_matrix):
+        """构建空间注意力偏置 (通用逻辑)"""
+        if kg_spatial_matrix is None:
+            return None
             
-        # === Core Processing: Map Target ID and Mask (修正 EOS 逻辑) ===
+        B, S = cls_ids.shape
+        map_ids = cls_ids - 2 
+        gather_ids = map_ids.clamp(min=0, max=self.num_element_classes - 1)
         
-        # 1. Cls Loss Target Mask: 包含 EOS (1) 和元素 ID (2-10)
-        valid_cls_target_mask = (target_cls_ids >= 1) & (target_cls_ids <= 10) # [B, S] <<< MODIFIED: Include EOS (ID 1)
-        # 2. Cls Loss Target Mapping: Map ID 1->0, ID 2->1, ..., ID 10->9
-        target_cls_ids_mapped = torch.clamp(target_cls_ids - 1, min=0, max=self.num_element_classes) # [B, S] <<< MODIFIED
+        b_idx = torch.arange(B, device=cls_ids.device).view(B, 1, 1).expand(-1, S, S)
+        row_idx = gather_ids.view(B, S, 1).expand(-1, -1, S)
+        col_idx = gather_ids.view(B, 1, S).expand(-1, S, -1)
         
-        final_cls_mask = cls_mask & valid_cls_target_mask # [B, S]
-        final_cls_mask_flat = final_cls_mask.view(-1)
+        rel_ids = kg_spatial_matrix[b_idx, row_idx, col_idx] 
         
-        # --- 1. Classification Loss (Cls ID - remains Cross-Entropy) ---
-        pred_cls_flat = pred_cls.view(-1, pred_cls.size(-1)) 
-        target_cls_ids_flat = target_cls_ids_mapped.view(-1) 
+        is_valid_obj = (map_ids >= 0)
+        valid_pair_mask = is_valid_obj.unsqueeze(2) & is_valid_obj.unsqueeze(1)
+        rel_ids = rel_ids.masked_fill(~valid_pair_mask, 0)
         
-        pred_cls_valid = pred_cls_flat[final_cls_mask_flat]
-        target_cls_valid = target_cls_ids_flat[final_cls_mask_flat]
+        spatial_bias = self.spatial_bias_embedding(rel_ids) 
+        spatial_bias = spatial_bias.permute(0, 3, 1, 2).contiguous() 
         
-        cls_loss_per_element = F.cross_entropy(
-            pred_cls_valid, 
-            target_cls_valid, 
-            reduction='none'
-        )
+        return spatial_bias
+
+    def forward(self, input_ids, attention_mask, kg_class_ids, padding_mask, 
+                kg_spatial_matrix=None, location_grids=None):
+        """Query-Based Forward Pass."""
         
-        if self.class_weights is not None:
-            # 注意: target_cls_valid 现在包含 ID 0 (EOS)
-            weights = self.class_weights[target_cls_valid] 
-            cls_loss_weighted = cls_loss_per_element * weights
+        # 1. Text Encoding
+        text_encoded = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state 
+
+        # 2. Query Embedding (Content)
+        # kg_class_ids: [B, T] -> [B, T, bb_size]
+        content_embed = self.obj_class_embedding(kg_class_ids)
+        
+        # === [MODIFIED] 3. Robust Position Injection ===
+        # 准备位置特征，初始化为 0
+        pos_feat = torch.zeros_like(content_embed)
+        
+        # A. 来自手工 Grid 的位置信息 (Explicit Handcrafted)
+        if location_grids is not None:
+            # location_grids: [B, T, 8, 8]
+            B, T, H, W = location_grids.shape
+            
+            # Flatten: [B, T, 64]
+            grid_flat = location_grids.view(B, T, -1).to(content_embed.device)
+            
+            # Encode: [B, T, 64] -> [B, T, bb_size]
+            handcrafted_pos = self.grid_encoder(grid_flat) # [B, T, bb_size]
+            pos_feat = pos_feat + handcrafted_pos
+
+        # B. 来自可学习网络的位置信息 (Implicit Learnable)
+        if kg_spatial_matrix is not None:
+            # 重新提取当前序列的关系矩阵 [B, T, T] (因为传入的是全类别的 9x9)
+            B, T = kg_class_ids.shape
+            map_ids = kg_class_ids - 2 
+            gather_ids = map_ids.clamp(min=0, max=self.num_element_classes - 1)
+            
+            b_idx = torch.arange(B, device=kg_class_ids.device).view(B, 1, 1).expand(-1, T, T)
+            row_idx = gather_ids.view(B, T, 1).expand(-1, -1, T)
+            col_idx = gather_ids.view(B, 1, T).expand(-1, T, -1)
+            
+            # 当前 batch 中物体 T 与物体 T 之间的关系 ID
+            seq_rel_ids = kg_spatial_matrix[b_idx, row_idx, col_idx] # [B, T, T]
+            
+            learned_pos = self.learnable_prior_net(seq_rel_ids) # [B, T, bb_size]
+            pos_feat = pos_feat + learned_pos # 叠加两种位置信息
+
+        # C. 门控融合 (Gated Fusion)
+        # 不再是简单的 layout_embed = content + pos
+        # 而是让模型决定怎么融合
+        layout_embed = self.fusion_gate(content_embed, pos_feat)
+        # ===============================================
+        
+        # 4. Masks
+        src_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        if padding_mask is not None:
+            trg_mask = torch.zeros_like(padding_mask, dtype=torch.float)
+            trg_mask = trg_mask.masked_fill(padding_mask, float('-inf'))
+            trg_mask = trg_mask.unsqueeze(1).unsqueeze(2)
         else:
-            cls_loss_weighted = cls_loss_per_element
-        
-        cls_loss = cls_loss_weighted.sum() / final_cls_mask_flat.sum().clamp(min=1) 
+            trg_mask = None
 
+        # 5. Spatial Bias (Attention Bias from KG Matrix)
+        spatial_bias = self.construct_spatial_bias(kg_class_ids, kg_spatial_matrix)
 
-        # --- 2. Coordinate Loss (BBox Token IDs - L_coord Cross-Entropy) ---
-        # Coord Loss 必须排除 EOS (ID 1)
-        valid_coord_target_mask = (target_cls_ids >= 2) & (target_cls_ids <= 10) # [B, S] <<< NEW MASK for Coord (Only elements)
-        
-        coord_mask_flat = (cls_mask & valid_coord_target_mask).unsqueeze(-1).expand(-1, -1, 4).flatten() # <<< MODIFIED: 只计算元素 (2-10) 的坐标损失
-        
-        pred_bbox_flat = pred_bbox_ids.flatten(0, 2) # [B*S*4, num_bins]
-        target_bbox_flat = target_bbox_ids.flatten()
-        
-        pred_bbox_valid = pred_bbox_flat[coord_mask_flat]
-        target_bbox_valid = target_bbox_flat[coord_mask_flat]
-        
-        coord_loss = F.cross_entropy(
-            pred_bbox_valid,
-            target_bbox_valid,
-            reduction='sum'
-        )
-        num_valid_tokens = (cls_mask & valid_coord_target_mask).sum().clamp(min=1) * 4 # <<< MODIFIED: 修正 num_valid_tokens
-        coord_loss = coord_loss / num_valid_tokens
-        
-        
-        # --- 3. Continuous Regression Loss (L_reg Smooth L1) ---
-        # 目标：将目标 BBox Token ID 反量化为 float 坐标
-        target_coord_float = self._detokenize_target_ids(target_bbox_ids) # [B, S, 4] float
-        
-        # 计算 Smooth L1 损失 (注意: target.detach() 是为了避免梯度流回数据)
-        reg_loss_per_coord = F.smooth_l1_loss(pred_coord_float, target_coord_float.detach(), reduction='none') # [B, S, 4]
-        
-        # 应用掩码并归一化
-        reg_loss_mask = (cls_mask & valid_coord_target_mask).unsqueeze(-1).float() # <<< MODIFIED: 掩码排除 EOS
-        reg_loss = reg_loss_per_coord * reg_loss_mask
-        reg_loss = reg_loss.sum() / num_valid_tokens
-        
+        # 6. Decoder
+        decoder_output = self.layout_decoder(
+            layout_embed, 
+            text_encoded, 
+            src_mask, 
+            trg_mask,
+            spatial_bias=spatial_bias
+        ) 
 
-        # --- 4. IoU Repulsion Loss (L_iou) ---
-        # **关键修复: L_iou 现在使用连续回归头的预测结果 pred_coord_float**
-        iou_loss = self._compute_iou_loss(
-            pred_boxes=pred_coord_float, 
-            valid_mask=(cls_mask & valid_coord_target_mask), # <<< MODIFIED: 掩码排除 EOS
-            iou_threshold=0.5
-        )
+        # 7. Prediction
+        pred_boxes = torch.sigmoid(self.reg_head(decoder_output))
+        
+        return None, None, pred_boxes, None
 
-        # --- 5. Area Penalty Loss (L_area) --- <<< NEW: 实现 Area Loss
-        # L1 惩罚预测框的面积 (w * h)
-        pred_area = pred_coord_float[..., 2] * pred_coord_float[..., 3] # [B, S] (w * h)
+    def get_loss(self, pred_cls, pred_bbox_ids, pred_boxes, pred_count, layout_seq, layout_mask, num_boxes, target_coords_gt=None, kg_spatial_matrix=None, kg_class_weights=None):
+        """
+        计算损失 (保持不变)
+        """
+        loss_mask = layout_mask 
+        target_boxes = target_coords_gt
         
-        # 使用 L1 损失惩罚面积本身（目标面积为 0.0）
-        area_loss_per_element = torch.abs(pred_area) # [B, S]
+        if loss_mask.dim() == 1:
+             loss_mask = loss_mask.view(pred_boxes.shape[0], -1)
         
-        # 应用掩码并归一化
-        area_loss_mask = (cls_mask & valid_coord_target_mask).float() # <<< MODIFIED: 掩码排除 EOS
-        num_valid_elements = area_loss_mask.sum().clamp(min=1)
+        num_valid = loss_mask.sum().clamp(min=1)
+
+        # 1. Reg Loss
+        loss_reg = F.smooth_l1_loss(pred_boxes, target_boxes, reduction='none') 
+        loss_reg = (loss_reg.mean(dim=-1) * loss_mask).sum() / num_valid
         
-        area_loss = area_loss_per_element * area_loss_mask
-        area_loss = area_loss.sum() / num_valid_elements # 归一化到每个有效元素
-        # ------------------------------------
+        # 2. IoU Loss
+        loss_iou = self._compute_iou_loss(pred_boxes, target_boxes, loss_mask)
         
-        # --- 6. Count Prediction Loss (L_count) ---
-        # **修改 7: 计算 L_count**
-        target_count = target_num_boxes.float().unsqueeze(1) # [B, 1]
-        count_loss = F.smooth_l1_loss(pred_count, target_count)
+        # 3. Area Loss
+        pred_w, pred_h = pred_boxes[..., 2], pred_boxes[..., 3]
+        tgt_w, tgt_h = target_boxes[..., 2], target_boxes[..., 3]
+        pred_area = pred_w * pred_h
+        tgt_area = tgt_w * tgt_h
+        loss_area = F.smooth_l1_loss(pred_area, tgt_area, reduction='none')
+        loss_area = (loss_area * loss_mask).sum() / num_valid
         
-        # --- 7. Combine Losses ---
-        # **修改 8: L_total 增加 L_count 和 L_area (应用各自的权重)**
-        total_loss = (self.cls_loss_weight * cls_loss) + \
-                     (self.coord_loss_weight * coord_loss) + \
-                     (self.reg_loss_weight * reg_loss) + \
-                     (self.iou_loss_weight * iou_loss) + \
-                     (self.count_loss_weight * count_loss) + \
-                     (self.area_loss_weight * area_loss) # <<< NEW: 添加 Area Loss
+        # 4. Relation Constraint Loss
+        loss_relation = self._compute_relation_loss(pred_boxes, loss_mask, kg_spatial_matrix)
+
+        # 5. Overlap Penalty
+        loss_overlap = self._compute_overlap_loss(pred_boxes, loss_mask, kg_spatial_matrix)
+
+        # 6. Size Prior Loss
+        loss_size_prior = self._compute_size_loss(pred_boxes, loss_mask, num_boxes, kg_class_weights)
+
+        # Total Loss
+        total_loss = self.reg_loss_weight * loss_reg + \
+                     self.iou_loss_weight * loss_iou + \
+                     self.area_loss_weight * loss_area + \
+                     self.relation_loss_weight * loss_relation + \
+                     self.overlap_loss_weight * loss_overlap + \
+                     self.size_loss_weight * loss_size_prior
+                     
+        return total_loss, loss_relation, loss_overlap, \
+               loss_reg, loss_iou, loss_size_prior, loss_area
+
+    def _compute_iou_loss(self, pred, target, mask):
+        pred_x1 = pred[..., 0] - pred[..., 2] / 2
+        pred_y1 = pred[..., 1] - pred[..., 3] / 2
+        pred_x2 = pred[..., 0] + pred[..., 2] / 2
+        pred_y2 = pred[..., 1] + pred[..., 3] / 2
         
-        # **修改 9: 返回值增加 count_loss 和 area_loss**
-        return total_loss, cls_loss, coord_loss, reg_loss, iou_loss, count_loss, area_loss # <<< NEW: 返回 Area Loss
+        tgt_x1 = target[..., 0] - target[..., 2] / 2
+        tgt_y1 = target[..., 1] - target[..., 3] / 2
+        tgt_x2 = target[..., 0] + target[..., 2] / 2
+        tgt_y2 = target[..., 1] + target[..., 3] / 2
+        
+        inter_x1 = torch.max(pred_x1, tgt_x1)
+        inter_y1 = torch.max(pred_y1, tgt_y1)
+        inter_x2 = torch.min(pred_x2, tgt_x2)
+        inter_y2 = torch.min(pred_y2, tgt_y2)
+        
+        inter_area = (inter_x2 - inter_x1).clamp(min=0) * (inter_y2 - inter_y1).clamp(min=0)
+        
+        pred_area = pred[..., 2] * pred[..., 3]
+        tgt_area = target[..., 2] * target[..., 3]
+        union_area = pred_area + tgt_area - inter_area
+        
+        iou = inter_area / (union_area + 1e-6)
+        
+        loss = (1.0 - iou) * mask
+        return loss.sum() / (mask.sum().clamp(min=1))
+
+    def _compute_relation_loss(self, pred_boxes, mask, kg_spatial_matrix):
+        if kg_spatial_matrix is None:
+            return torch.tensor(0.0, device=pred_boxes.device)
+            
+        loss = torch.tensor(0.0, device=pred_boxes.device)
+        B, S, _ = pred_boxes.shape
+        count = 0
+        
+        for b in range(B):
+            valid_indices = torch.nonzero(mask[b]).squeeze(1)
+            if len(valid_indices) < 2: continue
+            
+            for i in valid_indices:
+                for j in valid_indices:
+                    if i == j: continue
+                    rel_id = kg_spatial_matrix[b, i, j].item()
+                    if rel_id == 0: continue
+
+                    box_a = pred_boxes[b, i]
+                    box_b = pred_boxes[b, j]
+                    
+                    if rel_id in [1, 5]: # ABOVE / ON_TOP
+                        dist = box_a[1] - box_b[1] + 0.05
+                        if dist > 0:
+                            loss += dist
+                            count += 1
+                    elif rel_id == 2: # BELOW
+                        dist = box_b[1] - box_a[1] + 0.05
+                        if dist > 0:
+                            loss += dist
+                            count += 1
+                    elif rel_id == 3: # INSIDE
+                        a_x1, a_y1 = box_a[0]-box_a[2]/2, box_a[1]-box_a[3]/2
+                        a_x2, a_y2 = box_a[0]+box_a[2]/2, box_a[1]+box_a[3]/2
+                        b_x1, b_y1 = box_b[0]-box_b[2]/2, box_b[1]-box_b[3]/2
+                        b_x2, b_y2 = box_b[0]+box_b[2]/2, box_b[1]+box_b[3]/2
+                        
+                        l_inside = F.relu(b_x1 - a_x1) + F.relu(a_x2 - b_x2) + \
+                                   F.relu(b_y1 - a_y1) + F.relu(a_y2 - b_y2)
+                        if l_inside > 0:
+                            loss += l_inside
+                            count += 1
+
+        if count > 0:
+            return loss / count
+        return loss
+
+    def _compute_overlap_loss(self, pred_boxes, mask, kg_spatial_matrix):
+        loss = torch.tensor(0.0, device=pred_boxes.device)
+        B, S, _ = pred_boxes.shape
+        count = 0
+        
+        for b in range(B):
+            valid_indices = torch.nonzero(mask[b]).squeeze(1)
+            if len(valid_indices) < 2: continue
+            
+            boxes = pred_boxes[b, valid_indices]
+            N = boxes.shape[0]
+            
+            x1 = boxes[:, 0] - boxes[:, 2]/2
+            y1 = boxes[:, 1] - boxes[:, 3]/2
+            x2 = boxes[:, 0] + boxes[:, 2]/2
+            y2 = boxes[:, 1] + boxes[:, 3]/2
+            areas = boxes[:, 2] * boxes[:, 3]
+            
+            inter_x1 = torch.max(x1.unsqueeze(1), x1.unsqueeze(0))
+            inter_y1 = torch.max(y1.unsqueeze(1), y1.unsqueeze(0))
+            inter_x2 = torch.min(x2.unsqueeze(1), x2.unsqueeze(0))
+            inter_y2 = torch.min(y2.unsqueeze(1), y2.unsqueeze(0))
+            
+            inter_area = (inter_x2 - inter_x1).clamp(min=0) * (inter_y2 - inter_y1).clamp(min=0)
+            union_area = areas.unsqueeze(1) + areas.unsqueeze(0) - inter_area
+            iou_mat = inter_area / (union_area + 1e-6)
+            
+            ignore_overlap = torch.eye(N, device=pred_boxes.device).bool()
+            
+            if kg_spatial_matrix is not None:
+                for i_local, i_global in enumerate(valid_indices):
+                    for j_local, j_global in enumerate(valid_indices):
+                        if i_local == j_local: continue
+                        rel = kg_spatial_matrix[b, i_global, j_global].item()
+                        if rel in [3, 4]:
+                            ignore_overlap[i_local, j_local] = True
+                            ignore_overlap[j_local, i_local] = True
+            
+            triu_mask = torch.triu(torch.ones(N, N, device=pred_boxes.device), diagonal=1).bool()
+            target_mask = triu_mask & (~ignore_overlap)
+            
+            if target_mask.sum() > 0:
+                bad_iou = iou_mat[target_mask]
+                loss += F.relu(bad_iou - 0.1).sum()
+                count += target_mask.sum()
+
+        if count > 0:
+            return loss / count
+        return loss
+
+    def _compute_size_loss(self, pred_boxes, mask, num_boxes, weights=None):
+        pred_areas = pred_boxes[..., 2] * pred_boxes[..., 3] # [B, S]
+        
+        if num_boxes is None:
+            N = mask.sum(dim=1).clamp(min=1).float() # [B]
+        else:
+            N = num_boxes.float().clamp(min=1)
+            
+        base_expected_area = (0.5 / torch.sqrt(N)).unsqueeze(1) 
+        
+        if weights is not None:
+            target_areas = base_expected_area * weights
+        else:
+            target_areas = base_expected_area.expand_as(pred_areas)
+            
+        loss = F.smooth_l1_loss(pred_areas, target_areas, reduction='none')
+        loss = (loss * mask).sum() / mask.sum().clamp(min=1)
+        return loss

@@ -23,7 +23,8 @@ class LayoutDecoder(nn.Module):
         self.layer_norm = nn.LayerNorm(hidden_size + bb_size, eps=1e-6)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, layout_embed: torch.Tensor, text_features: torch.Tensor, src_mask: torch.Tensor, trg_mask: torch.Tensor):
+    # [MODIFIED] Added spatial_bias parameter
+    def forward(self, layout_embed: torch.Tensor, text_features: torch.Tensor, src_mask: torch.Tensor, trg_mask: torch.Tensor, spatial_bias: torch.Tensor = None):
         # layout_embed: [B, T, bb_size]
         # text_features: [B, L_text, hidden_size]
         B, T, bb_size_dim = layout_embed.shape
@@ -43,7 +44,8 @@ class LayoutDecoder(nn.Module):
         # Iterate through the stack of layers
         for layer in self.layers:
             # layout_x 和 text_x 都是 Query，text_features 是 Memory
-            layout_x, text_x = layer(layout_x, text_x, text_features, src_mask, trg_mask)
+            # [MODIFIED] Pass spatial_bias to each layer
+            layout_x, text_x = layer(layout_x, text_x, text_features, src_mask, trg_mask, spatial_bias=spatial_bias)
 
         # After all layers, concatenate the final streams
         # Order: [text_features_stream, layout_features_stream]

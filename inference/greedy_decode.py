@@ -1,164 +1,127 @@
-# File: tianyusun1/test2/test2-cc8b0f0a73b00d0c96a3d267fe297e6b8a7891be/inference/greedy_decode.py
+# File: tianyusun1/test2/test2-2.0/inference/greedy_decode.py (V4.1: FULLY PARAMETERIZED DIVERSITY)
 
 import torch
 import numpy as np
-import math
-# Note: We assume Poem2LayoutGenerator and its dependencies are importable
-# via sys.path manipulation in the calling script (e.g., scripts/infer.py)
 
-# --- NEW: Import KG ---
-# 假设 models/kg.py 位于搜索路径中
+# --- Import KG & Location ---
 try:
     from models.kg import PoetryKnowledgeGraph
 except ImportError:
-    print("[Warning] Could not import PoetryKnowledgeGraph.")
-# --------------------
+    print("[Error] Could not import PoetryKnowledgeGraph. Make sure models/kg.py is accessible.")
+    PoetryKnowledgeGraph = None
 
-# --- NEW: Import BBoxTokenizer ---
-# 假设 data/utils 中的 BBoxTokenizer 可以被导入
+# [NEW] 导入位置生成器
 try:
-    from data.utils import BBoxTokenizer
+    from models.location import LocationSignalGenerator
 except ImportError:
-    # 临时处理，如果导入失败则打印警告
-    print("[Warning] Could not import BBoxTokenizer. Make sure data/utils.py is accessible.")
-    class BBoxTokenizer:
-        def __init__(self, num_bins): pass
-        def tokenize(self, value): return 0
-        def detokenize(self, bin_id): return 0.0
-# --------------------------------
+    print("[Error] Could not import LocationSignalGenerator. Make sure models/location.py is accessible.")
+    LocationSignalGenerator = None
+# -----------------
 
-def generate_square_subsequent_mask(sz, device='cuda'):
-    """Generates a square subsequent mask for causal attention."""
-    mask = (torch.triu(torch.ones(sz, sz, device=device)) == 1).transpose(0, 1)
-    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-    return mask
-
-def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements: int = 20, device: str = 'cuda'):
+# [MODIFIED] 增加 mode 和 top_k 参数，默认值为 'greedy' 以保持向后兼容
+def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, device='cuda', mode='greedy', top_k=3):
     """
-    Greedy decoding to generate a layout sequence from a poem (using discrete BBox tokens and KG).
+    Query-Based decoding with Location Guidance:
+    1. Use KG to determine *what* objects are in the poem (Queries).
+    2. Use LocationGenerator to determine *roughly where* they should be (Grid Signal).
+    3. Use Model to determine *exactly where* they are (Layout).
     
     Args:
-        model: Trained Poem2LayoutGenerator model. 
-        # ... (rest of args)
+        model: Trained Poem2LayoutGenerator.
+        tokenizer: BertTokenizer.
+        poem: Input string.
+        mode: 'greedy' or 'sample'.
+        top_k: Top-K sampling parameter.
     Returns:
-        layout: List of (cls_id, cx, cy, w, h), where cls_id is 2-10 range.
+        layout: List of (cls_id, cx, cy, w, h).
     """
+    if PoetryKnowledgeGraph is None:
+        return []
+
     model.eval()
     device = torch.device(device)
     model.to(device)
-
-    # --- Initialize BBox Tokenizer ---
-    try:
-        num_bins = model.num_bbox_bins
-    except AttributeError:
-        raise AttributeError("Model attribute 'num_bbox_bins' not found. Ensure Poem2LayoutGenerator is initialized correctly.")
+    
+    # 1. 实例化组件
+    pkg = PoetryKnowledgeGraph()
+    
+    # [NEW] 实例化位置生成器 (使用 8x8 Grid)
+    if LocationSignalGenerator is not None:
+        location_gen = LocationSignalGenerator(grid_size=8) # [MODIFIED] 8x8
+    else:
+        location_gen = None
+    
+    # 2. KG 提取内容
+    # 提取视觉特征向量
+    kg_vector = pkg.extract_visual_feature_vector(poem)
+    
+    # 转为物体 ID 列表 (2-10)
+    existing_indices = torch.nonzero(kg_vector > 0).squeeze(1)
+    kg_class_ids = (existing_indices + 2).tolist()
+    
+    if not kg_class_ids:
+        return []
         
-    bbox_tokenizer = BBoxTokenizer(num_bins=num_bins)
-    range_divisor = num_bins - 1
-    # --------------------------------
-
-    # --- NEW: 提取 KG 向量 (关键修改) ---
-    # 1. 实例化 KG
-    pkg = PoetryKnowledgeGraph() 
-    # 2. 提取特征 (原始 9 维 CPU Tensor)
-    kg_vector_raw = pkg.extract_visual_feature_vector(poem) 
-    # 3. 调整形状并移动到设备 (供模型使用)
-    kg_vector = kg_vector_raw.unsqueeze(0).to(device) 
-
-    # NEW: 打印 KG 向量 (用于调试)
-    print("\n-------------------- KG DEBUG (Inference) ---------------------")
-    print(f"Inference Poem: '{poem}'")
-    # 内部 ID 0-8 对应原始 ID 2-10 (2:mountain, 3:water, ..., 10:animal)
-    print(f"KG Vector (ID 2-10): {kg_vector_raw.tolist()}") 
-    print("---------------------------------------------------------------")
-    # -------------------------------------
-
-    # 1. Setup text encoding and masks
+    # 3. 准备模型输入 Tensor
+    # Content Queries: [1, S]
+    kg_class_tensor = torch.tensor([kg_class_ids], dtype=torch.long).to(device)
+    
+    # Spatial Matrix (Bias): [1, 9, 9]
+    kg_spatial_matrix_raw = pkg.extract_spatial_matrix(poem)
+    kg_spatial_matrix = kg_spatial_matrix_raw.unsqueeze(0).to(device) 
+    
+    # === [NEW] 生成位置引导信号 (Location Grids) ===
+    location_grids_tensor = None
+    
+    if location_gen is not None:
+        # 初始化画布状态 (8x8)
+        current_occupancy = torch.zeros((8, 8), dtype=torch.float32) # [MODIFIED] 8x8
+        grids_list = []
+        
+        for i, cls_id in enumerate(kg_class_ids):
+            matrix_idx = cls_id - 2
+            
+            # 获取关系 (注意: kg_spatial_matrix_raw 是 CPU Tensor)
+            row = kg_spatial_matrix_raw[matrix_idx]
+            col = kg_spatial_matrix_raw[:, matrix_idx]
+            
+            # [MODIFIED] 使用传入的 mode 和 top_k 参数
+            signal, current_occupancy = location_gen.infer_stateful_signal(
+                i, row, col, current_occupancy, 
+                mode=mode, top_k=top_k 
+            )
+            grids_list.append(signal)
+            
+        # Stack & Batch Dimension: [1, S, 8, 8]
+        location_grids_tensor = torch.stack(grids_list).unsqueeze(0).to(device)
+    # ===============================================
+    
+    # 文本编码
+    inputs = tokenizer(poem, return_tensors='pt', padding=True, truncation=True, max_length=64)
+    input_ids = inputs['input_ids'].to(device)
+    attention_mask = inputs['attention_mask'].to(device)
+    
+    # Padding Mask
+    padding_mask = torch.zeros(kg_class_tensor.shape, dtype=torch.bool).to(device)
+    
+    # 4. 单次前向传播 (One-Shot Prediction)
     with torch.no_grad():
-        inputs = tokenizer(poem, return_tensors='pt', padding=True, truncation=True, max_length=64)
-        input_ids = inputs['input_ids'].to(device)
-        attention_mask = inputs['attention_mask'].to(device)
-
-        # Encode text: [B, L_text, H]
-        text_features = model.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        # 模型返回: (None, None, pred_boxes, None)
+        _, _, pred_boxes, _ = model(
+            input_ids=input_ids, 
+            attention_mask=attention_mask, 
+            kg_class_ids=kg_class_tensor, 
+            padding_mask=padding_mask, 
+            kg_spatial_matrix=kg_spatial_matrix,
+            location_grids=location_grids_tensor # [NEW] 传入 Grid (8x8)
+        )
         
-        # --- NEW: 注入 KG 特征 (与 model.forward 逻辑一致) ---
-        # kg_feat: [1, 9] -> projection -> [1, H]
-        kg_feat = model.kg_projection(kg_vector) # <--- 使用移动到设备的 kg_vector
-        # Augment text features: [1, L_text, H] + [1, 1, H] -> [1, L_text, H]
-        text_features = text_features + kg_feat.unsqueeze(1)
-        # -----------------------------------------------------
+    # 5. 格式化输出
+    layout = []
+    boxes_flat = pred_boxes[0].cpu().tolist()
+    
+    for cls_id, box in zip(kg_class_ids, boxes_flat):
+        cx, cy, w, h = box
+        layout.append((float(cls_id), cx, cy, w, h))
         
-        src_mask = attention_mask.unsqueeze(1).unsqueeze(2) # [B, 1, 1, L_text]
-
-        # 2. Initialize sequences
-        batch_size = 1
-        generated_cls_ids = torch.full((batch_size, 1), model.bos_token_id, dtype=torch.long, device=device)
-        generated_bboxes = torch.zeros((batch_size, 1, 4), dtype=torch.long, device=device) 
-
-        # 3. Autoregressive Loop
-        for step in range(max_elements):
-            current_num_elements = generated_cls_ids.size(1)
-
-            # --- Forward Pass ---
-            layout_embed = model.layout_embedding(generated_cls_ids, generated_bboxes) 
-            trg_mask = generate_square_subsequent_mask(current_num_elements, device=device) # [T, T]
-            
-            # 使用增强后的 text_features
-            decoder_output = model.layout_decoder(layout_embed, text_features, src_mask, trg_mask)
-            
-            # Get predictions for the last element 
-            last_output = decoder_output[:, -1, :] 
-            next_cls_logits = model.cls_head(last_output)
-            
-            # Get BBox Token Logits from 4 heads
-            next_cx_logits = model.cx_head(last_output)
-            next_cy_logits = model.cy_head(last_output)
-            next_w_logits = model.w_head(last_output)
-            next_h_logits = model.h_head(last_output)
-
-            # Greedy selection for classes
-            next_cls_id = next_cls_logits.argmax(dim=-1) # [B] (Internal ID 0-9)
-            
-            # Greedy selection for BBox IDs (Argmax on Logits)
-            next_cx_id = next_cx_logits.argmax(dim=-1) # [B]
-            next_cy_id = next_cy_logits.argmax(dim=-1)
-            next_w_id = next_w_logits.argmax(dim=-1)
-            next_h_id = next_h_logits.argmax(dim=-1)
-            
-            next_bbox_ids = torch.stack([next_cx_id, next_cy_id, next_w_id, next_h_id], dim=1)
-
-            # --- Stopping Condition (EOS) ---
-            # is_eos = (next_cls_id == model.eos_token_id) # 原代码: 使用 ID 1 (现在 ID 1 是元素 2)
-            is_eos = (next_cls_id == 0) # <<< MODIFIED: EOS 对应的内部索引是 0
-            if is_eos.all():
-                break
-
-            # Update sequences (generated_bboxes MUST BE LONG IDs)
-            generated_cls_ids = torch.cat([generated_cls_ids, next_cls_id.unsqueeze(1)], dim=1)
-            generated_bboxes = torch.cat([generated_bboxes, next_bbox_ids.unsqueeze(1)], dim=1) # <--- Use LongTensor IDs
-
-        # 4. Final Extraction and Mapping
-        final_cls_ids = generated_cls_ids[0, 1:] 
-        final_bbox_ids = generated_bboxes[0, 1:] # [N, 4] LongTensor of IDs
-
-        # Detokenize BBox IDs to float coordinates
-        final_bboxes_float = final_bbox_ids.float() / range_divisor # [N, 4] FloatTensor
-
-        layout = []
-        for cls_id_tensor, bbox_float_tensor in zip(final_cls_ids, final_bboxes_float):
-            internal_cls_id = cls_id_tensor.item() # Internal ID (0-9)
-            
-            # if internal_cls_id < 0 or internal_cls_id >= model.num_element_classes: # 原代码: 检查 0-8
-            #     continue 
-            
-            if internal_cls_id == 0: # <<< MODIFIED: Internal ID 0 is EOS
-                continue
-            
-            # original_cls_id = internal_cls_id + 2 # 原代码: internal 1->3
-            original_cls_id = internal_cls_id + 1 # <<< MODIFIED: Map internal 1-9 to original 2-10
-            
-            cx, cy, w, h = bbox_float_tensor.tolist()
-            layout.append((original_cls_id, cx, cy, w, h))
-
-        return layout
+    return layout

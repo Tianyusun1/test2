@@ -1,31 +1,42 @@
-# File: tianyusun1/test2/test2-bbb825395418d78edd547068aa7210d1e2c95933/configs/default.yaml
+# File: tianyusun1/test2/test2-2.0/configs/default.yaml (FINAL LOGIC-DRIVEN CONFIG)
 
 model:
   # BERT encoder
   bert_path: "/home/610-sty/huggingface/bert-base-chinese"
-  hidden_size: 768  # BERT hidden size
+  hidden_size: 768
   # Layout decoder
-  bb_size: 64       
-  decoder_layers: 6       
+  bb_size: 64
+  decoder_layers: 6
   decoder_heads: 8
-  dropout: 0.2      
+  dropout: 0.3
   # Output
-  num_classes: 9    
+  num_classes: 9
   
-  # --- DISCRETE BBOX PARAMETERS (NEW) ---
-  num_bbox_bins: 1000       
-  cls_embed_dim: 16         
-  bbox_embed_dim: 12        
-  iou_loss_weight: 10.0     # <<<< 修改: IOU 排斥损失权重 (5.0 -> 100.0)
-  # --------------------------------------
+  # --- Legacy Discrete Parameters (保留以防报错，但不再核心使用) ---
+  num_bbox_bins: 1000
+  cls_embed_dim: 16
+  bbox_embed_dim: 12
+  # -----------------------------------------------------------
+
+  # === LOSS WEIGHTS (CRITICAL UPDATE) ===
+  # 1. 弱化 GT 监督 (因为标注不可靠)
+  reg_loss_weight: 1.0      # [LOWERED] 从 10.0 降为 1.0
+  iou_loss_weight: 1.0      # [LOWERED] 从 10.0 降为 1.0
+  area_loss_weight: 1.0     # [LOWERED] 从 10.0 降为 1.0
   
-  coord_loss_weight: 1.0     # BBox Token 分类损失
-  reg_loss_weight: 50.0       # 连续回归损失权重
-  cls_loss_weight: 5.0     # 分类损失权重
-  count_loss_weight: 10.0   # <<<< 新增: 数量预测损失权重
-  area_loss_weight: 10.0    # <<<< 新增: 面积惩罚权重 (惩罚大框)
+  # 2. 强化 KG 与 常识约束 (这是新的"老师")
+  relation_loss_weight: 5.0 # [NEW] 强约束：必须遵守 KG 的空间关系 (Above/Inside等)
+  overlap_loss_weight: 2.0  # [NEW] 物理约束：惩罚非包含关系的物体重叠
+  size_loss_weight: 2.0     # [NEW] 统计约束：物体越多，框应该越小
+  
+  # Legacy weights (可以保留或设为0)
+  coord_loss_weight: 0.0    
+  cls_loss_weight: 0.0      # Query-Based 不需要分类损失
+  count_loss_weight: 0.0    # Query-Based 不需要计数损失
+
   # Inference
-  max_elements: 30 
+  max_elements: 30
+  
   # Data paths
   xlsx_path: "/home/610-sty/Layout2Paint/dataset/6800poems.xlsx"
   images_dir: "/home/610-sty/Layout2Paint/dataset/6800"
@@ -35,13 +46,12 @@ model:
 
 training:
   batch_size: 16
-  epochs: 100
-  learning_rate: 0.00005 
+  epochs: 400
+  learning_rate: 0.0001
   warmup_steps: 1000
-  save_every: 10 
+  save_every: 50
   output_dir: "./outputs"
   log_steps: 10
 
 inference:
   max_output_length: 30
-  # beam_size: 1
