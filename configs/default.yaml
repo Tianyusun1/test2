@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-4.0/configs/default.yaml (V4.3: OPTIMIZED CURRICULUM CONFIG)
+# File: tianyusun1/test2/test2-4.0/configs/default.yaml (V5.0: R-GAT + AESTHETIC LOSS CONFIG)
 
 model:
   # BERT encoder
@@ -22,7 +22,7 @@ model:
   # -----------------------------------------------------------
 
   # === LOSS WEIGHTS (INITIAL VALUES FOR CURRICULUM) ===
-  # 注意：trainer.py 的双重课程学习策略会动态调整这些权重。
+  # 注意：trainer.py 的双重课程学习策略会动态调整 reg/rel/overlap 权重。
   # 这里的设定值对应课程的第一阶段（0-100 Epoch）：强逻辑，弱回归。
   
   # 1. 弱化 GT 监督 (初始阶段)
@@ -33,11 +33,17 @@ model:
   # 2. 强化 KG 与 常识约束
   relation_loss_weight: 5.0 # [CURRICULUM START] 初始高权重，后期动态降至 3.0 (保底逻辑)
   
-  # [MODIFIED V4.3] 提升初始重叠惩罚
-  # 原为 2.0，现提升至 3.0，配合 Trainer 后期动态增加至 5.0+，强力解决物体堆叠问题。
+  # 3. 空间合理性
+  # [MODIFIED] 提升初始重叠惩罚
+  # 原为 2.0，现提升至 3.0，配合 Trainer 后期动态增加至 6.0+，强力解决物体堆叠问题。
   overlap_loss_weight: 3.0  
   
   size_loss_weight: 2.0     # [NEW] 统计约束：物体越多，框应该越小
+  
+  # 4. [NEW V5.0] 审美约束 (Aesthetic Losses)
+  # 建议使用较小的权重 (0.2 - 1.0)，作为辅助 Loss 提升构图美感，避免破坏语义正确性。
+  alignment_loss_weight: 0.5  # 鼓励框边缘对齐
+  balance_loss_weight: 0.5    # 鼓励视觉重心居中
   
   # Legacy weights (可以保留或设为0)
   coord_loss_weight: 0.0    

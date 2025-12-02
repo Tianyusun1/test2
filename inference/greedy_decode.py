@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-4.0/inference/greedy_decode.py (V4.2: CVAE COMPATIBLE)
+# File: tianyusun1/test2/test2-4.0/inference/greedy_decode.py (V5.0: R-GAT + AESTHETIC COMPATIBLE)
 
 import torch
 import numpy as np
@@ -10,7 +10,7 @@ except ImportError:
     print("[Error] Could not import PoetryKnowledgeGraph. Make sure models/kg.py is accessible.")
     PoetryKnowledgeGraph = None
 
-# [NEW] 导入位置生成器
+# 导入位置生成器 (V4.5+ Gaussian Support)
 try:
     from models.location import LocationSignalGenerator
 except ImportError:
@@ -29,7 +29,7 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, de
        - This introduces diversity: calling this function multiple times yields different layouts.
     
     Args:
-        model: Trained Poem2LayoutGenerator (V4.2+).
+        model: Trained Poem2LayoutGenerator (V5.0+).
         tokenizer: BertTokenizer.
         poem: Input string.
         mode: 'greedy' or 'sample' (Controls LocationGenerator behavior).
@@ -47,7 +47,7 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, de
     # 1. 实例化组件
     pkg = PoetryKnowledgeGraph()
     
-    # [NEW] 实例化位置生成器 (使用 8x8 Grid)
+    # 实例化位置生成器 (使用 8x8 Grid)
     if LocationSignalGenerator is not None:
         location_gen = LocationSignalGenerator(grid_size=8)
     else:
@@ -69,10 +69,11 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, de
     kg_class_tensor = torch.tensor([kg_class_ids], dtype=torch.long).to(device)
     
     # Spatial Matrix (Bias): [1, 9, 9]
+    # KG V4.3 增强了空间推理逻辑，这里直接调用即可
     kg_spatial_matrix_raw = pkg.extract_spatial_matrix(poem)
     kg_spatial_matrix = kg_spatial_matrix_raw.unsqueeze(0).to(device) 
     
-    # === [NEW] 生成位置引导信号 (Location Grids) ===
+    # === 生成位置引导信号 (Location Grids) ===
     location_grids_tensor = None
     
     if location_gen is not None:
@@ -87,7 +88,8 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, de
             row = kg_spatial_matrix_raw[matrix_idx]
             col = kg_spatial_matrix_raw[:, matrix_idx]
             
-            # [MODIFIED] 使用传入的 mode 和 top_k 参数控制 Grid 的随机性
+            # 使用传入的 mode 和 top_k 参数控制 Grid 的随机性
+            # LocationGenerator V4.5 支持 infer_stateful_signal
             signal, current_occupancy = location_gen.infer_stateful_signal(
                 i, row, col, current_occupancy, 
                 mode=mode, top_k=top_k 
@@ -103,14 +105,15 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, de
     input_ids = inputs['input_ids'].to(device)
     attention_mask = inputs['attention_mask'].to(device)
     
-    # Padding Mask
+    # Padding Mask (推理时通常全为 False，表示没有 Padding)
     padding_mask = torch.zeros(kg_class_tensor.shape, dtype=torch.bool).to(device)
     
     # 4. 单次前向传播 (One-Shot Prediction)
     with torch.no_grad():
-        # [CVAE Update] 
+        # [CVAE Inference] 
         # Model returns: mu, logvar, pred_boxes, decoder_output
-        # We implicitly pass target_boxes=None, triggering z ~ N(0, 1) sampling inside model.
+        # target_boxes=None, 触发 z ~ N(0, 1) 采样，生成多样化结果
+        # GNN (R-GAT) 会在内部自动处理 kg_spatial_matrix
         _, _, pred_boxes, _ = model(
             input_ids=input_ids, 
             attention_mask=attention_mask, 

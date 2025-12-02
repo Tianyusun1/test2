@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-4.0/scripts/infer.py
+# File: tianyusun1/test2/test2-4.0/scripts/infer.py (V5.0: ADAPTED FOR AESTHETIC LOSS)
 
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
@@ -26,8 +26,8 @@ def main():
     parser.add_argument("--mode", type=str, default="sample", choices=["greedy", "sample"], help="Decoding mode: 'greedy' for deterministic, 'sample' for diversity")
     parser.add_argument("--top_k", type=int, default=3, help="Top-K for sampling (only used in sample mode)")
     # [NEW V4.2] 新增采样次数参数，用于展示 CVAE 的多样性
-    parser.add_argument("--num_samples", type=int, default=1, help="Number of samples to generate per poem (CVAE diversity check)")
-    parser.add_argument("--checkpoint", type=str, default=None, help="Path to specific checkpoint. If None, uses latest/best in output_dir")
+    parser.add_argument("--num_samples", type=int, default=3, help="Number of samples to generate per poem (CVAE diversity check)")
+    parser.add_argument("--checkpoint", type=str, default="/home/610-sty/Layout2Paint5.1/outputs/model_epoch_400_val_loss_0.9350.pth", help="Path to specific checkpoint. If None, uses latest/best in output_dir")
     args = parser.parse_args()
 
     # 1. Load config
@@ -49,10 +49,16 @@ def main():
         decoder_layers=config['model']['decoder_layers'],
         decoder_heads=config['model']['decoder_heads'],
         dropout=config['model']['dropout'],
+        
         # === [NEW] 传入 CVAE 参数 ===
         latent_dim=config['model'].get('latent_dim', 32), # 必须传入，否则加载权重会报错
-        # === Loss Weights (Inference时不使用，但需占位) ===
-        reg_loss_weight=config['model'].get('reg_loss_weight', 1.0)
+        
+        # === Loss Weights (Inference时不使用，但需占位以匹配 __init__ 签名) ===
+        reg_loss_weight=config['model'].get('reg_loss_weight', 1.0),
+        
+        # [NEW V5.0] Aesthetic Weights Placeholders
+        alignment_loss_weight=config['model'].get('alignment_loss_weight', 0.5),
+        balance_loss_weight=config['model'].get('balance_loss_weight', 0.5)
     )
 
     # 4. Load checkpoint

@@ -468,6 +468,7 @@ class PoetryKnowledgeGraph:
             if tree_idx in present_indices:
                 for other_idx in present_indices:
                     # 避免修改树与山的包含关系 (静态先验 Tree INSIDE Mountain 优先级更高)
+                    # 这里的逻辑可以根据需要调整，目前简单地让树在其他所有物体之上（除了山）
                     if other_idx != tree_idx and (other_idx + 2) != 2: # Ignore Mountain
                         relation_matrix[tree_idx, other_idx] = self.RELATION_IDS['above']
 

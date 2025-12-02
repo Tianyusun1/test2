@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-4.0/scripts/train.py
+# File: tianyusun1/test2/test2-4.0/scripts/train.py (V5.0: ADAPTED FOR AESTHETIC LOSS)
 
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
@@ -108,12 +108,12 @@ def main():
     print(f"Calculated Class Weights (Internal 0:EOS, 1-9:Elements 2-10): {class_weights_tensor.tolist()}")
     # ---------------------------
 
-    # 3. Init model (传入所有损失权重，包括新增的 Reg, Cls, Count, Area)
+    # 3. Init model (传入所有损失权重，包括新增的 Aesthetic Losses)
     print(f"Initializing model with latent_dim={model_config.get('latent_dim', 32)}...")
     model = Poem2LayoutGenerator(
         bert_path=model_config['bert_path'],
         num_classes=num_element_classes, # 实际元素类别数 (9)
-        # --- BBox Discrete Parameters ---
+        # --- BBox Discrete Parameters (Legacy) ---
         num_bbox_bins=model_config['num_bbox_bins'],
         bbox_embed_dim=model_config['bbox_embed_dim'],
         # --------------------------------------
@@ -123,16 +123,26 @@ def main():
         decoder_heads=model_config['decoder_heads'],
         dropout=model_config['dropout'],
         
-        # === [NEW] 传入 CVAE 参数 ===
-        latent_dim=model_config.get('latent_dim', 32), # 默认为 32
+        # === CVAE 参数 ===
+        latent_dim=model_config.get('latent_dim', 32),
         
-        # --- 传入所有损失权重 ---
+        # --- 传入所有损失权重 (Updated for V5.0) ---
         coord_loss_weight=model_config['coord_loss_weight'],
         iou_loss_weight=model_config.get('iou_loss_weight', 1.0), 
-        reg_loss_weight=model_config.get('reg_loss_weight', 1.0),    # 传入 reg_loss_weight
-        cls_loss_weight=model_config.get('cls_loss_weight', 1.0),    # 传入 cls_loss_weight
-        count_loss_weight=model_config.get('count_loss_weight', 1.0),# 传入 count_loss_weight
-        area_loss_weight=model_config.get('area_loss_weight', 1.0),  # 传入 area_loss_weight
+        reg_loss_weight=model_config.get('reg_loss_weight', 1.0),    
+        cls_loss_weight=model_config.get('cls_loss_weight', 1.0),    
+        count_loss_weight=model_config.get('count_loss_weight', 1.0),
+        area_loss_weight=model_config.get('area_loss_weight', 1.0),
+        
+        # 核心逻辑权重
+        relation_loss_weight=model_config.get('relation_loss_weight', 5.0),
+        overlap_loss_weight=model_config.get('overlap_loss_weight', 3.0),
+        size_loss_weight=model_config.get('size_loss_weight', 2.0),
+        
+        # [NEW V5.0] 审美权重
+        alignment_loss_weight=model_config.get('alignment_loss_weight', 0.5),
+        balance_loss_weight=model_config.get('balance_loss_weight', 0.5),
+        
         class_weights=class_weights_tensor 
         # -----------------------------------------
     )

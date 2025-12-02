@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-4.0/trainers/trainer.py (V4.5: FINAL ADAPTED TRAINER)
+# File: tianyusun1/test2/test2-4.0/trainers/trainer.py (V5.0: AESTHETIC LOSS SUPPORT)
 
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
@@ -81,7 +81,7 @@ class LayoutTrainer:
         # 最佳模型路径追踪
         self.current_best_model_path = None
         
-        # 损失历史追踪
+        # 损失历史追踪 (扩充以监控所有新 Loss)
         self.train_loss_history = []
         self.val_loss_history = []
         
@@ -93,6 +93,10 @@ class LayoutTrainer:
         self.val_overlap_history = []  
         self.val_size_history = []      
         self.val_kl_history = []      
+        
+        # [NEW V5.0] 新增审美损失历史
+        self.val_alignment_history = []
+        self.val_balance_history = []
 
     def _get_lr_scheduler(self):
         """定义带线性 Warmup、5 Epoch Hold 和后续衰减的学习率调度器。"""
@@ -128,20 +132,17 @@ class LayoutTrainer:
 
     def _update_curriculum(self, epoch):
         """
-        [V4.4 Optimized] 修正后的课程学习策略：
-        1. 逻辑权重 (Relation): 5.0 -> 3.0 (保底逻辑)
-        2. 重叠权重 (Overlap): 3.0 -> 6.0 (强力抗挤压)
-        3. 回归权重 (Reg): 1.0 -> 5.0 (逐步提升精度)
-        4. KL Weight: Annealing
+        [V4.2] 课程学习策略更新：
+        1. 动态调整 Reconstruction Weights (Logic -> Realism)
+        2. 动态调整 KL Weight (KL Annealing)
         """
         
-        # --- 策略 A: 权重转移 (100-300 epoch) ---
+        # --- 策略 A: 权重转移 (Rel: 5->1, Reg: 1->5, 在 100-300 epoch 间线性过渡) ---
         
-        # 阶段 1: 强逻辑预热 (0-100 Epoch)
+        # 阶段 1: 强逻辑 (0-100 Epoch)
         if epoch < 100:
             new_rel_weight = 5.0
             new_reg_weight = 1.0
-            new_overlap_weight = 3.0 # 初始值配合 config
         
         # 阶段 2: 线性过渡 (100-300 Epoch)
         else:
@@ -150,48 +151,48 @@ class LayoutTrainer:
             
             progress = min(1.0, (epoch - transition_start_epoch) / transition_duration)
             
-            # Rel: 5.0 -> 3.0 (保留底线)
-            new_rel_weight = 5.0 - (2.0 * progress) 
-            
-            # Reg: 1.0 -> 5.0 (提升精度)
+            # Rel: 5.0 -> 1.0
+            new_rel_weight = 5.0 - (4.0 * progress) 
+            # Reg: 1.0 -> 5.0
             new_reg_weight = 1.0 + (4.0 * progress) 
             
-            # Overlap: 3.0 -> 6.0 (强力分家)
-            new_overlap_weight = 3.0 + (3.0 * progress)
-            
-        # 更新模型权重属性
+        # 更新模型权重属性 (供 get_loss 使用)
         if hasattr(self.model, 'relation_loss_weight'):
             self.model.relation_loss_weight = new_rel_weight
         if hasattr(self.model, 'reg_loss_weight'):
             self.model.reg_loss_weight = new_reg_weight
-        if hasattr(self.model, 'overlap_loss_weight'):
-            self.model.overlap_loss_weight = new_overlap_weight
         
         # --- 策略 B: KL Annealing (0-50: 0, 50-150: 线性增加到 0.01) ---
+        
         target_kl = 0.01
+        
+        # 阶段 1: 延迟开始 (0-50 Epoch)
         if epoch < 50:
             kl_weight = 0.0
+            
+        # 阶段 2: 线性增加 (50-150 Epoch)
         else:
             kl_transition_start = 50
-            kl_transition_duration = 100
+            kl_transition_duration = 100 # 50 -> 150
+            
             kl_progress = min(1.0, (epoch - kl_transition_start) / kl_transition_duration)
             kl_weight = target_kl * kl_progress
             
-        return new_rel_weight, new_reg_weight, kl_weight, new_overlap_weight
+        # 返回当前权重和 KL 因子
+        return new_rel_weight, new_reg_weight, kl_weight
 
     def _run_epoch(self, data_loader, is_training: bool, epoch: int = 0):
         """处理一个训练/验证/测试轮次"""
         self.model.train() if is_training else self.model.eval()
         
-        # 应用课程学习
+        # 应用课程学习 (仅训练时更新权重并获取因子，验证时沿用模型的权重并使用固定 KL 因子)
         if is_training:
-            cur_rel_w, cur_reg_w, cur_kl_w, cur_over_w = self._update_curriculum(epoch)
+            cur_rel_w, cur_reg_w, cur_kl_w = self._update_curriculum(epoch)
         else:
-            # 验证/测试默认值
+            # 验证/测试时，使用模型当前配置的重建权重，KL 权重使用 0.01 用于观察最终总损失
             cur_rel_w = self.model.relation_loss_weight if hasattr(self.model, 'relation_loss_weight') else 5.0
             cur_reg_w = self.model.reg_loss_weight if hasattr(self.model, 'reg_loss_weight') else 1.0
-            cur_over_w = self.model.overlap_loss_weight if hasattr(self.model, 'overlap_loss_weight') else 3.0
-            cur_kl_w = 0.01 
+            cur_kl_w = 0.01 # 固定的 KL 权重
 
         # 初始化运行损失变量
         total_loss_val = 0.0
@@ -201,7 +202,11 @@ class LayoutTrainer:
         total_relation_loss = 0.0 
         total_overlap_loss = 0.0 
         total_size_loss = 0.0
-        total_kl_loss = 0.0 
+        # [NEW V5.0]
+        total_align_loss = 0.0
+        total_balance_loss = 0.0
+        
+        total_kl_loss = 0.0 # 存储原始 KL 散度值
         
         context_manager = contextlib.nullcontext() if is_training else torch.no_grad()
         
@@ -231,7 +236,6 @@ class LayoutTrainer:
                     location_grids = location_grids.to(self.device)
                 
                 # 2. 前向传播 (CVAE)
-                # [重要] target_boxes 传入用于训练时计算 Posterior q(z|x)
                 mu, logvar, pred_boxes, _ = self.model(
                     input_ids=input_ids, 
                     attention_mask=attention_mask, 
@@ -239,10 +243,10 @@ class LayoutTrainer:
                     padding_mask=padding_mask, 
                     kg_spatial_matrix=kg_spatial_matrix,
                     location_grids=location_grids,
-                    target_boxes=target_boxes # [NEW] 传入 GT 用于 Layout Transformer Encoder
+                    target_boxes=target_boxes # 传入 GT 用于 Encoder
                 )
                 
-                # 3. 计算重建损失
+                # 3. 计算重建损失 (Reconstruction Loss)
                 loss_tuple = self.model.get_loss(
                     pred_cls=None, 
                     pred_bbox_ids=None, 
@@ -256,24 +260,27 @@ class LayoutTrainer:
                     kg_class_weights=kg_class_weights
                 )
                 
-                loss_recons, relation_loss, overlap_loss, reg_loss, iou_loss, size_loss, area_loss = loss_tuple
+                # [MODIFIED V5.0] 解包重建损失 (共 9 个)
+                loss_recons, relation_loss, overlap_loss, reg_loss, iou_loss, size_loss, area_loss, align_loss, balance_loss = loss_tuple
                 
-                # 4. 计算 KL 散度损失
+                # 4. 计算 KL 散度损失 (KL Divergence)
                 if mu is not None and logvar is not None:
-                    # KLD = -0.5 * sum(1 + logvar - mu^2 - exp(logvar))
+                    # Sum over latent dim, Mean over batch
                     kl_val = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
                 else:
                     kl_val = torch.tensor(0.0, device=self.device)
                 
-                # 5. 总损失 = 重建 + KL * beta
+                # 5. 总损失 = 重建 + KL * beta (使用当前 KL 权重)
                 final_loss = loss_recons + cur_kl_w * kl_val
                 
                 if is_training:
                     self.optimizer.zero_grad()
                     final_loss.backward()
+                    # 梯度裁剪
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     self.optimizer.step()
                     
+                    # 学习率调度器更新
                     self.scheduler.step()
                     self.global_step += 1
                 
@@ -285,22 +292,28 @@ class LayoutTrainer:
                 total_relation_loss += relation_loss.item()
                 total_overlap_loss += overlap_loss.item()
                 total_size_loss += size_loss.item()
-                total_kl_loss += kl_val.item()
+                # [NEW]
+                total_align_loss += align_loss.item()
+                total_balance_loss += balance_loss.item()
                 
-                # 6. 打印日志
+                total_kl_loss += kl_val.item() 
+                
+                # 6. 打印日志 (Training log)
                 if is_training and (step + 1) % self.log_steps == 0:
                     current_lr = self.optimizer.param_groups[0]['lr']
                     print(f"Epoch [{epoch+1}][TRAIN] Step {step+1}/{data_len} | "
                           f"LR: {current_lr:.6e} | "
                           f"Total: {final_loss.item():.4f} | "
-                          f"Rel(W={cur_rel_w:.1f}): {relation_loss.item():.4f} | "
-                          f"Over(W={cur_over_w:.1f}): {overlap_loss.item():.4f} | "
-                          f"Reg(W={cur_reg_w:.1f}): {reg_loss.item():.4f} | "
-                          f"KL(W={cur_kl_w:.4f}): {kl_val.item():.4f}")
+                          f"Rel: {relation_loss.item():.3f} | "
+                          f"Reg: {reg_loss.item():.3f} | "
+                          f"Alg: {align_loss.item():.3f} | "
+                          f"Bal: {balance_loss.item():.3f} | "
+                          f"KL: {kl_val.item():.4f}")
         
+        # 计算平均损失
         num_batches = len(data_loader)
         if num_batches == 0:
-             return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+             return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
         return (
             total_loss_val / num_batches,
@@ -310,6 +323,8 @@ class LayoutTrainer:
             total_iou_loss / num_batches,
             total_size_loss / num_batches,
             total_area_loss / num_batches,
+            total_align_loss / num_batches,   # [NEW]
+            total_balance_loss / num_batches, # [NEW]
             total_kl_loss / num_batches
         )
 
@@ -319,8 +334,8 @@ class LayoutTrainer:
         print("\n--- Starting Validation ---")
         
         avg_losses = self._run_epoch(self.val_loader, is_training=False, epoch=epoch)
-        # 解包 8 个值
-        avg_val_loss, avg_rel, avg_over, avg_reg, avg_iou, avg_size, avg_area, avg_kl = avg_losses
+        # [MODIFIED V5.0] 解包 10 个值
+        avg_val_loss, avg_rel, avg_over, avg_reg, avg_iou, avg_size, avg_area, avg_align, avg_bal, avg_kl = avg_losses
         
         end_time = time.time()
         print(f"--- Validation Finished in {end_time - start_time:.2f}s ---")
@@ -333,13 +348,17 @@ class LayoutTrainer:
         self.val_relation_history.append(avg_rel)
         self.val_overlap_history.append(avg_over)
         self.val_size_history.append(avg_size)
+        self.val_alignment_history.append(avg_align) # [NEW]
+        self.val_balance_history.append(avg_bal)     # [NEW]
         self.val_kl_history.append(avg_kl)
         
         print(f"Val Avg Loss: Total: {avg_val_loss:.4f} | "
               f"Rel: {avg_rel:.4f} | "
               f"Over: {avg_over:.4f} | "
               f"Reg: {avg_reg:.4f} | " 
-              f"KL: {avg_kl:.4f} (Original KL)") 
+              f"Alg: {avg_align:.4f} | "
+              f"Bal: {avg_bal:.4f} | "
+              f"KL: {avg_kl:.4f}") 
               
         return avg_val_loss
 
@@ -349,7 +368,8 @@ class LayoutTrainer:
         print("\n--- Starting Test Set Evaluation ---")
         
         avg_losses = self._run_epoch(self.test_loader, is_training=False, epoch=999) 
-        avg_test_loss, avg_rel, avg_over, avg_reg, avg_iou, avg_size, avg_area, avg_kl = avg_losses
+        # [MODIFIED V5.0] 解包
+        avg_test_loss, avg_rel, avg_over, avg_reg, avg_iou, avg_size, avg_area, avg_align, avg_bal, avg_kl = avg_losses
         
         end_time = time.time()
         print(f"--- Test Finished in {end_time - start_time:.2f}s ---")
@@ -358,13 +378,16 @@ class LayoutTrainer:
               f"Rel: {avg_rel:.4f} | "
               f"Over: {avg_over:.4f} | "
               f"Reg: {avg_reg:.4f} | " 
-              f"KL: {avg_kl:.4f} (Original KL)") 
+              f"Alg: {avg_align:.4f} | "
+              f"Bal: {avg_bal:.4f} | "
+              f"KL: {avg_kl:.4f}") 
               
         return avg_test_loss
 
     def _run_inference_example(self, epoch):
-        """运行固定样例的推理"""
+        """运行固定样例的推理并保存可视化图片"""
         print(f"\n--- Running Inference Example for Epoch {epoch+1} ---")
+        
         self.model.eval() 
         poem_text = self.example_poem['poem']
         print(f"Poem: {poem_text}")
@@ -395,6 +418,7 @@ class LayoutTrainer:
         draw_layout(layout, f"PRED (CVAE) E{epoch+1}: {poem_text}", output_path)
         print(f"-> Generated layout saved to {output_path}")
 
+        # 真实布局可视化
         if epoch == 0 or (epoch + 1) % (self.visualize_every * 10) == 0:
             true_boxes = self.example_poem['boxes']
             true_layout_path = os.path.join(self.output_dir, f"layout_true_example.png")
@@ -405,26 +429,30 @@ class LayoutTrainer:
         self.model.train()
 
     def _plot_loss_history(self):
-        """分离绘制 Reconstruction Loss 和 KL Loss"""
+        """绘制并保存损失变化轨迹图 (分离 Reconstruction 和 KL)"""
         if not self.train_loss_history:
             return
 
         epochs = range(1, len(self.train_loss_history) + 1)
         
-        # === 图 1: 重建损失 ===
+        # === 图 1: 重建损失 (Reconstruction Losses) ===
         plt.figure(figsize=(12, 8))
+        
         plt.plot(epochs, self.train_loss_history, label='Train Total', color='blue', marker='o', linestyle='-', alpha=0.6, markersize=3)
-        plt.plot(epochs, self.val_loss_history, label='Val Total', color='red', marker='s', linestyle='-', alpha=0.8, markersize=3)
+        plt.plot(epochs, self.val_loss_history, label='Val Total (w/ KL)', color='red', marker='s', linestyle='-', alpha=0.8, markersize=3)
         
         if len(self.val_reg_history) > 1:
-            plt.plot(epochs, self.val_relation_history, label='Val Relation', color='green', linestyle=':', alpha=0.7)
-            plt.plot(epochs, self.val_overlap_history, label='Val Overlap', color='orange', linestyle=':', alpha=0.7)
+            plt.plot(epochs, self.val_relation_history, label='Val Rel', color='green', linestyle=':', alpha=0.7)
+            plt.plot(epochs, self.val_overlap_history, label='Val Over', color='orange', linestyle=':', alpha=0.7)
             plt.plot(epochs, self.val_reg_history, label='Val Reg', color='purple', linestyle='--', alpha=0.5) 
+            # [NEW] 绘制审美损失
+            plt.plot(epochs, self.val_alignment_history, label='Val Align', color='cyan', linestyle='-.', alpha=0.6)
+            plt.plot(epochs, self.val_balance_history, label='Val Bal', color='magenta', linestyle='-.', alpha=0.6)
 
-        plt.title('Reconstruction Loss Trajectory', fontsize=14)
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss Value')
-        plt.legend(loc='upper right')
+        plt.title('Loss Trajectory (V5.0: R-GAT + Aesthetic)', fontsize=14)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel('Loss Value', fontsize=12)
+        plt.legend(loc='upper right', fontsize=10)
         plt.grid(True, linestyle='--', alpha=0.5)
         
         try:
@@ -432,22 +460,28 @@ class LayoutTrainer:
             plt.close()
             print(f"-> Reconstruction loss plot saved to {self.plot_path_recons}")
         except Exception as e:
-            print(f"[Warning] Could not save Reconstruction plot: {e}")
+            print(f"[Warning] Could not save Reconstruction loss plot: {e}")
 
-        # === 图 2: KL 散度 ===
+        # === 图 2: KL 散度 (KL Divergence) ===
         if len(self.val_kl_history) > 1:
             plt.figure(figsize=(10, 6))
+            
             plt.plot(epochs, self.val_kl_history, label='Original KL Div', color='darkblue', marker='.', linestyle='-')
             
-            # 可视化权重
             kl_weights_plot = [self._update_curriculum(e - 1)[2] for e in epochs]
             ax2 = plt.gca().twinx()
             ax2.plot(epochs, kl_weights_plot, label='KL Weight (Beta)', color='red', linestyle='--', alpha=0.5)
-            ax2.set_ylabel('KL Weight', color='red')
+            ax2.set_ylabel('KL Weight (Beta)', color='red')
+            ax2.tick_params(axis='y', labelcolor='red')
+
+            plt.title('KL Divergence Trajectory (Annealing)', fontsize=14)
+            plt.xlabel('Epoch', fontsize=12)
+            plt.ylabel('KL Value (Validation)', fontsize=12)
             
-            plt.title('KL Divergence Trajectory', fontsize=14)
-            plt.xlabel('Epoch')
-            plt.ylabel('KL Value')
+            lines, labels = plt.gca().get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax2.legend(lines + lines2, labels + labels2, loc='upper right', fontsize=10)
+            
             plt.grid(True, linestyle='--', alpha=0.5)
             
             try:
@@ -468,50 +502,44 @@ class LayoutTrainer:
             epoch_start_time = time.time()
             print(f"\n==================== Epoch {epoch+1}/{self.epochs} | Training ====================")
             
-            # 运行训练
             avg_train_loss = self._run_epoch(self.train_loader, is_training=True, epoch=epoch)[0]
             self.train_loss_history.append(avg_train_loss)
             
             epoch_end_time = time.time()
             print(f"\nEpoch {epoch+1} finished. Avg Training Loss: {avg_train_loss:.4f} ({epoch_end_time - epoch_start_time:.2f}s)")
             
-            # 运行验证
             avg_val_loss = self.validate(epoch=epoch) 
 
-            # 可视化
             self._plot_loss_history()
             
-            # 可视化推理
             if (epoch + 1) % self.visualize_every == 0:
                 self._run_inference_example(epoch)
 
-            # 保存检查点
             if (epoch + 1) % self.save_every == 0:
                 self.test() 
                 model_name = f"model_epoch_{epoch+1}_val_loss_{avg_val_loss:.4f}.pth"
                 checkpoint_path = os.path.join(self.output_dir, model_name)
-                torch.save({
-                    'model_state_dict': self.model.state_dict(), 
-                    'epoch': epoch+1, 
-                    'val_loss': avg_val_loss,
-                    'optimizer_state_dict': self.optimizer.state_dict()}, 
+                torch.save(
+                    {'model_state_dict': self.model.state_dict(), 
+                     'epoch': epoch+1, 
+                     'val_loss': avg_val_loss,
+                     'optimizer_state_dict': self.optimizer.state_dict()}, 
                     checkpoint_path
                 )
                 print(f"-> Checkpoint saved to {checkpoint_path}")
 
-            # 保存最佳模型
             if avg_val_loss < best_val_loss:
-                print("-> New best validation loss achieved.")
+                print("-> New best validation loss achieved. Replacing previous best model.")
                 prev_best_path = self.current_best_model_path
                 best_val_loss = avg_val_loss
                 model_name = f"model_best_val_loss_{avg_val_loss:.4f}.pth" 
                 new_best_path = os.path.join(self.output_dir, model_name)
                 
-                torch.save({
-                    'model_state_dict': self.model.state_dict(), 
-                    'epoch': epoch+1, 
-                    'val_loss': avg_val_loss,
-                    'optimizer_state_dict': self.optimizer.state_dict()}, 
+                torch.save(
+                    {'model_state_dict': self.model.state_dict(), 
+                     'epoch': epoch+1, 
+                     'val_loss': avg_val_loss,
+                     'optimizer_state_dict': self.optimizer.state_dict()}, 
                     new_best_path
                 )
                 print(f"-> New best model saved to {new_best_path}")
