@@ -1,3 +1,5 @@
+# models/decoder.py (V5.3 Fixed Initialization)
+
 import torch
 import torch.nn as nn
 from .transformer_layers import PoemLayoutDecoderLayer
@@ -30,15 +32,19 @@ class LayoutDecoder(nn.Module):
         B, T, bb_size_dim = layout_embed.shape
         B_text, L_text, hidden_size_dim = text_features.shape
 
-        # === 关键修复区域 ===
-        # 1. 移除 BUG：原代码错误地将 [CLS] token 重复 T 次作为 text_x 的初始值。
-        # 2. 修复：将 text_x 初始化为零向量 (Zero Tensor)，避免 [CLS] token 污染自注意力上下文。
+        # === 关键修复区域 (V5.2 Fix) ===
+        # 原问题：全 0 初始化导致第一层 Text 流缺乏语义引导，Cross-Attention 退化。
+        # 修正：使用 BERT 的 [CLS] token (Index 0) 初始化 text_x 流。
+        # 这为 Text 流提供了全局语义上下文作为起点。
         
-        # text_x 流在初始时应为零，其信息将通过 PoemLayoutDecoderLayer 内部的 Cross-Attention 从 text_features 中获取。
-        text_x = torch.zeros(B, T, hidden_size_dim, device=layout_embed.device) 
+        # 1. 提取 [CLS] token: [B, L_text, H] -> [B, 1, H]
+        cls_token = text_features[:, 0, :].unsqueeze(1)
+        
+        # 2. 扩展到序列长度 T: [B, 1, H] -> [B, T, H]
+        # 使用 clone() 确保后续 inplace 操作安全
+        text_x = cls_token.expand(-1, T, -1).clone()
         
         layout_x = layout_embed # [B, T, bb_size]
-        # 原有的 BUG 赋值语句 text_x = text_repr_for_layout 已被移除。
         # ==================
 
         # Iterate through the stack of layers

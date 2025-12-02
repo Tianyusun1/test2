@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-4.0/data/dataset.py (V4.6: ENHANCED AUGMENTATION)
+# File: tianyusun1/test2/test2-4.0/data/dataset.py (V5.3: ENHANCED AUGMENTATION + JITTER)
 
 import os
 import torch
@@ -9,7 +9,7 @@ from torch.utils.data import Dataset
 from transformers import BertTokenizer
 from typing import List, Tuple, Dict, Optional
 import numpy as np 
-import random # [NEW]
+import random # [NEW] Needed for jitter
 
 # --- 导入知识图谱模型 ---
 from models.kg import PoetryKnowledgeGraph
@@ -155,11 +155,21 @@ class PoegraphLayoutDataset(Dataset):
             spatial_col = kg_spatial_matrix[:, matrix_idx] 
             
             # 调用 location_gen 进行有状态推理
-            # 训练数据生成时通常使用默认的 'greedy' 模式以保持稳定，
-            # 但也可以根据需要改为 'sample' 来做数据增强。这里保持默认。
+            # [V5.3 MODIFIED] 训练阶段引入随机性 (Sample 模式)
+            # 这允许同一物体在不同次采样中选择不同的高斯模板 (例如 sky_left vs sky_right)
             signal, current_occupancy = self.location_gen.infer_stateful_signal(
-                i, spatial_row, spatial_col, current_occupancy
+                i, spatial_row, spatial_col, current_occupancy,
+                mode='sample', top_k=3 
             )
+            
+            # [NEW V5.3] 随机水平平移 (Horizontal Jitter)
+            # 打破 "Location Grid 总是指向正中间" 的先验偏差
+            # 70% 的概率发生平移，模拟物体在画布上的随机分布
+            if random.random() < 0.7: 
+                # 在 8x8 网格上随机左右平移 1-2 格
+                shift = random.randint(-2, 2) 
+                # torch.roll 会循环移动像素。对于高斯分布，这能模拟物体偏离中心甚至部分在画外的情况。
+                signal = torch.roll(signal, shifts=shift, dims=1) 
             
             location_grids_list.append(signal)
             
@@ -214,7 +224,7 @@ class PoegraphLayoutDataset(Dataset):
                 if do_flip:
                     box[0] = 1.0 - box[0]
                 
-                # 2. Jitter (微小抖动)
+                # 2. Jitter (微小抖动) - 用于 Regression 目标微调
                 # 稍微加大一点抖动范围 (-0.02 ~ 0.02)
                 noise = np.random.uniform(-0.02, 0.02, size=4)
                 box_aug = [

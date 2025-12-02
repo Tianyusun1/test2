@@ -137,17 +137,17 @@ class LayoutTrainer:
         2. 动态调整 KL Weight (KL Annealing)
         """
         
-        # --- 策略 A: 权重转移 (Rel: 5->1, Reg: 1->5, 在 100-300 epoch 间线性过渡) ---
+        # --- 策略 A: 权重转移 (Rel: 5->1, Reg: 1->5, 在epoch 间线性过渡) ---
         
-        # 阶段 1: 强逻辑 (0-100 Epoch)
-        if epoch < 100:
+        # 阶段 1: 强逻辑
+        if epoch < 50:
             new_rel_weight = 5.0
             new_reg_weight = 1.0
         
-        # 阶段 2: 线性过渡 (100-300 Epoch)
+        # 阶段 2: 线性过渡
         else:
-            transition_start_epoch = 100
-            transition_duration = 200 # 100 -> 300
+            transition_start_epoch = 50
+            transition_duration = 100 
             
             progress = min(1.0, (epoch - transition_start_epoch) / transition_duration)
             
@@ -162,19 +162,17 @@ class LayoutTrainer:
         if hasattr(self.model, 'reg_loss_weight'):
             self.model.reg_loss_weight = new_reg_weight
         
-        # --- 策略 B: KL Annealing (0-50: 0, 50-150: 线性增加到 0.01) ---
+        # --- 策略 B: KL Annealing (V5.2: Early Intervention) ---
         
         target_kl = 0.01
         
-        # 阶段 1: 延迟开始 (0-50 Epoch)
-        if epoch < 50:
+        # [MODIFIED V5.2] 提早介入 KL Loss (Epoch 5)，防止 Posterior Collapse
+        kl_transition_start = 5
+        kl_transition_duration = 50 # 5 -> 55 快速上升，强迫模型使用 z
+        
+        if epoch < kl_transition_start:
             kl_weight = 0.0
-            
-        # 阶段 2: 线性增加 (50-150 Epoch)
         else:
-            kl_transition_start = 50
-            kl_transition_duration = 100 # 50 -> 150
-            
             kl_progress = min(1.0, (epoch - kl_transition_start) / kl_transition_duration)
             kl_weight = target_kl * kl_progress
             

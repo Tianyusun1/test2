@@ -1,11 +1,11 @@
-# File: tianyusun1/test2/test2-4.0/configs/default.yaml (V5.0: R-GAT + AESTHETIC LOSS CONFIG)
+# File: tianyusun1/test2/test2-4.0/configs/default.yaml (V5.3: NO AESTHETIC LOSS + HIGH DIMENSION)
 
 model:
   # BERT encoder
   bert_path: "/home/610-sty/huggingface/bert-base-chinese"
   hidden_size: 768
   # Layout decoder
-  bb_size: 64
+  bb_size: 128            # [MODIFIED V5.3] 增大维度至 128，提升特征容量
   decoder_layers: 6
   decoder_heads: 8
   dropout: 0.3
@@ -17,13 +17,12 @@ model:
   
   # --- Legacy Discrete Parameters (保留以防报错，但不再核心使用) ---
   num_bbox_bins: 1000
-  cls_embed_dim: 16
-  bbox_embed_dim: 12
+  cls_embed_dim: 32
+  bbox_embed_dim: 24
   # -----------------------------------------------------------
 
   # === LOSS WEIGHTS (INITIAL VALUES FOR CURRICULUM) ===
   # 注意：trainer.py 的双重课程学习策略会动态调整 reg/rel/overlap 权重。
-  # 这里的设定值对应课程的第一阶段（0-100 Epoch）：强逻辑，弱回归。
   
   # 1. 弱化 GT 监督 (初始阶段)
   reg_loss_weight: 1.0      # [CURRICULUM START] 初始低权重，后期动态升至 5.0
@@ -34,16 +33,14 @@ model:
   relation_loss_weight: 5.0 # [CURRICULUM START] 初始高权重，后期动态降至 3.0 (保底逻辑)
   
   # 3. 空间合理性
-  # [MODIFIED] 提升初始重叠惩罚
-  # 原为 2.0，现提升至 3.0，配合 Trainer 后期动态增加至 6.0+，强力解决物体堆叠问题。
   overlap_loss_weight: 3.0  
-  
   size_loss_weight: 2.0     # [NEW] 统计约束：物体越多，框应该越小
   
-  # 4. [NEW V5.0] 审美约束 (Aesthetic Losses)
-  # 建议使用较小的权重 (0.2 - 1.0)，作为辅助 Loss 提升构图美感，避免破坏语义正确性。
-  alignment_loss_weight: 0.5  # 鼓励框边缘对齐
-  balance_loss_weight: 0.5    # 鼓励视觉重心居中
+  # 4. [NEW V5.3] 审美约束 (Aesthetic Losses)
+  # [CRITICAL] 彻底关闭审美约束，防止模型陷入“中轴线死锁”。
+  # 先让模型学会“乱跑”（多样性），以后再微调“美感”。
+  alignment_loss_weight: 0.0 # [V5.3] 设为 0，允许不对称构图
+  balance_loss_weight: 0.0   # [V5.3] 设为 0，允许重心偏离中心
   
   # Legacy weights (可以保留或设为0)
   coord_loss_weight: 0.0    
@@ -62,14 +59,13 @@ model:
 
 training:
   batch_size: 16
-  epochs: 400
+  epochs: 200             # [MODIFIED] 缩短为 200 Epochs，配合加速的课程学习
   learning_rate: 0.0001
   warmup_steps: 1000
   save_every: 50
   output_dir: "./outputs"
   log_steps: 10
-  # [NEW] 增加可视化频率配置，方便调试
-  visualize_every: 1
+  visualize_every: 1      # 保持高频可视化以便观察
 
 inference:
   max_output_length: 30
