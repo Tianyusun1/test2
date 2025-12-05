@@ -1,164 +1,173 @@
-# File: tianyusun1/test2/test2-cc8b0f0a73b00d0c96a3d267fe297e6b8a7891be/inference/greedy_decode.py
+# File: tianyusun1/test2/test2-5.1/inference/greedy_decode.py (V5.3: QUANTITY AWARE + JITTER)
 
 import torch
 import numpy as np
-import math
-# Note: We assume Poem2LayoutGenerator and its dependencies are importable
-# via sys.path manipulation in the calling script (e.g., scripts/infer.py)
+import random # [NEW] Needed for jitter logic
 
-# --- NEW: Import KG ---
-# 假设 models/kg.py 位于搜索路径中
+# --- Import KG & Location ---
 try:
     from models.kg import PoetryKnowledgeGraph
 except ImportError:
-    print("[Warning] Could not import PoetryKnowledgeGraph.")
-# --------------------
+    print("[Error] Could not import PoetryKnowledgeGraph. Make sure models/kg.py is accessible.")
+    PoetryKnowledgeGraph = None
 
-# --- NEW: Import BBoxTokenizer ---
-# 假设 data/utils 中的 BBoxTokenizer 可以被导入
+# 导入位置生成器 (V4.5+ Gaussian Support)
 try:
-    from data.utils import BBoxTokenizer
+    from models.location import LocationSignalGenerator
 except ImportError:
-    # 临时处理，如果导入失败则打印警告
-    print("[Warning] Could not import BBoxTokenizer. Make sure data/utils.py is accessible.")
-    class BBoxTokenizer:
-        def __init__(self, num_bins): pass
-        def tokenize(self, value): return 0
-        def detokenize(self, bin_id): return 0.0
-# --------------------------------
+    print("[Error] Could not import LocationSignalGenerator. Make sure models/location.py is accessible.")
+    LocationSignalGenerator = None
+# -----------------
 
-def generate_square_subsequent_mask(sz, device='cuda'):
-    """Generates a square subsequent mask for causal attention."""
-    mask = (torch.triu(torch.ones(sz, sz, device=device)) == 1).transpose(0, 1)
-    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-    return mask
-
-def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements: int = 20, device: str = 'cuda'):
-    """
-    Greedy decoding to generate a layout sequence from a poem (using discrete BBox tokens and KG).
+# [NEW V5.2] 定义所有类别的形状先验 (Shape Priors)
+# 防止物体塌缩或形状畸形。这些是物理/常识约束。
+# 2:mtn, 3:water, 4:ppl, 5:tree, 6:bldg, 7:bridge, 8:flower, 9:bird, 10:animal
+CLASS_SHAPE_PRIORS = {
+    # 背景大物体 (山、水) -> 至少要有一定规模
+    2: {'min_w': 0.20, 'min_h': 0.20}, # Mountain
+    3: {'min_w': 0.20, 'min_h': 0.10}, # Water
     
-    Args:
-        model: Trained Poem2LayoutGenerator model. 
-        # ... (rest of args)
-    Returns:
-        layout: List of (cls_id, cx, cy, w, h), where cls_id is 2-10 range.
+    # 瘦高物体 (人、树)
+    4: {'min_w': 0.02, 'min_h': 0.08, 'max_w': 0.15}, # People (人应该是瘦高的)
+    5: {'min_w': 0.05, 'min_h': 0.15}, # Tree (树应该是比较高的)
+    
+    # 块状物体 (建筑)
+    6: {'min_w': 0.05, 'min_h': 0.05}, # Building
+    
+    # 扁平物体 (桥)
+    7: {'min_w': 0.15, 'max_h': 0.08}, # Bridge (桥应该是宽而扁的)
+    
+    # 小物体 (花、鸟、兽) -> 防止变成不可见的点
+    8: {'min_w': 0.03, 'min_h': 0.03}, # Flower
+    9: {'min_w': 0.03, 'min_h': 0.03}, # Bird
+    10: {'min_w': 0.04, 'min_h': 0.04} # Animal
+}
+
+def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, device='cuda', mode='greedy', top_k=3):
     """
+    Query-Based decoding with Location Guidance & CVAE Diversity.
+    """
+    if PoetryKnowledgeGraph is None:
+        return []
+
     model.eval()
     device = torch.device(device)
     model.to(device)
-
-    # --- Initialize BBox Tokenizer ---
-    try:
-        num_bins = model.num_bbox_bins
-    except AttributeError:
-        raise AttributeError("Model attribute 'num_bbox_bins' not found. Ensure Poem2LayoutGenerator is initialized correctly.")
+    
+    # 1. 实例化组件
+    pkg = PoetryKnowledgeGraph()
+    
+    if LocationSignalGenerator is not None:
+        location_gen = LocationSignalGenerator(grid_size=8)
+    else:
+        location_gen = None
+    
+    # 2. KG 提取内容 (含数量扩展逻辑)
+    kg_vector = pkg.extract_visual_feature_vector(poem)
+    existing_indices = torch.nonzero(kg_vector > 0).squeeze(1)
+    raw_class_ids = (existing_indices + 2).tolist()
+    
+    if not raw_class_ids:
+        return []
         
-    bbox_tokenizer = BBoxTokenizer(num_bins=num_bins)
-    range_divisor = num_bins - 1
-    # --------------------------------
+    # [MODIFIED] 调用 KG 进行数量扩展 (解决"两只鸟"等问题)
+    # 需确保 models/kg.py 已更新包含此方法
+    if hasattr(pkg, 'expand_ids_with_quantity'):
+        kg_class_ids = pkg.expand_ids_with_quantity(raw_class_ids, poem)
+        # [验证输出]
+        if len(kg_class_ids) > len(raw_class_ids):
+            print(f"[Infer Debug] Quantity Rules Applied: {raw_class_ids} -> {kg_class_ids}")
+    else:
+        kg_class_ids = raw_class_ids
+        
+    # Limit max length
+    if max_elements:
+        kg_class_ids = kg_class_ids[:max_elements]
+        
+    # 3. 准备模型输入 Tensor
+    kg_class_tensor = torch.tensor([kg_class_ids], dtype=torch.long).to(device)
+    
+    kg_spatial_matrix_raw = pkg.extract_spatial_matrix(poem)
+    kg_spatial_matrix = kg_spatial_matrix_raw.unsqueeze(0).to(device) 
+    
+    # === 生成位置引导信号 (含 Jitter) ===
+    location_grids_tensor = None
+    
+    if location_gen is not None:
+        current_occupancy = torch.zeros((8, 8), dtype=torch.float32)
+        grids_list = []
+        
+        for i, cls_id in enumerate(kg_class_ids):
+            # Class ID (2-10) -> Matrix Index (0-8)
+            matrix_idx = int(cls_id) - 2
+            if matrix_idx < 0 or matrix_idx >= 9: matrix_idx = 0 # Safety
+            
+            row = kg_spatial_matrix_raw[matrix_idx]
+            col = kg_spatial_matrix_raw[:, matrix_idx]
+            
+            signal, current_occupancy = location_gen.infer_stateful_signal(
+                i, row, col, current_occupancy, 
+                mode=mode, top_k=top_k 
+            )
+            
+            # [NEW V5.3] 引入位置抖动 (Jitter)
+            # 打破 "Location Grid 总是指向正中间" 的先验偏差
+            # 仅在 sample 模式下启用，保持 greedy 的确定性
+            shift_val = 0
+            if mode == 'sample':
+                if random.random() < 0.6: # 60% 概率发生偏移
+                    shift_val = random.randint(-2, 2)
+                    signal = torch.roll(signal, shifts=shift_val, dims=1)
+            
+            if shift_val != 0:
+                # 可选：打印调试信息
+                # print(f"[Infer Debug] Obj {i} (Class {cls_id}): Jitter shift {shift_val}")
+                pass
 
-    # --- NEW: 提取 KG 向量 (关键修改) ---
-    # 1. 实例化 KG
-    pkg = PoetryKnowledgeGraph() 
-    # 2. 提取特征 (原始 9 维 CPU Tensor)
-    kg_vector_raw = pkg.extract_visual_feature_vector(poem) 
-    # 3. 调整形状并移动到设备 (供模型使用)
-    kg_vector = kg_vector_raw.unsqueeze(0).to(device) 
-
-    # NEW: 打印 KG 向量 (用于调试)
-    print("\n-------------------- KG DEBUG (Inference) ---------------------")
-    print(f"Inference Poem: '{poem}'")
-    # 内部 ID 0-8 对应原始 ID 2-10 (2:mountain, 3:water, ..., 10:animal)
-    print(f"KG Vector (ID 2-10): {kg_vector_raw.tolist()}") 
-    print("---------------------------------------------------------------")
-    # -------------------------------------
-
-    # 1. Setup text encoding and masks
+            grids_list.append(signal)
+            
+        location_grids_tensor = torch.stack(grids_list).unsqueeze(0).to(device)
+    # ========================
+    
+    # 文本编码
+    inputs = tokenizer(poem, return_tensors='pt', padding=True, truncation=True, max_length=64)
+    input_ids = inputs['input_ids'].to(device)
+    attention_mask = inputs['attention_mask'].to(device)
+    
+    padding_mask = torch.zeros(kg_class_tensor.shape, dtype=torch.bool).to(device)
+    
+    # 4. 单次前向传播
     with torch.no_grad():
-        inputs = tokenizer(poem, return_tensors='pt', padding=True, truncation=True, max_length=64)
-        input_ids = inputs['input_ids'].to(device)
-        attention_mask = inputs['attention_mask'].to(device)
-
-        # Encode text: [B, L_text, H]
-        text_features = model.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        _, _, pred_boxes, _ = model(
+            input_ids=input_ids, 
+            attention_mask=attention_mask, 
+            kg_class_ids=kg_class_tensor, 
+            padding_mask=padding_mask, 
+            kg_spatial_matrix=kg_spatial_matrix,
+            location_grids=location_grids_tensor
+        )
         
-        # --- NEW: 注入 KG 特征 (与 model.forward 逻辑一致) ---
-        # kg_feat: [1, 9] -> projection -> [1, H]
-        kg_feat = model.kg_projection(kg_vector) # <--- 使用移动到设备的 kg_vector
-        # Augment text features: [1, L_text, H] + [1, 1, H] -> [1, L_text, H]
-        text_features = text_features + kg_feat.unsqueeze(1)
-        # -----------------------------------------------------
+    # 5. 格式化输出 (应用形状先验)
+    layout = []
+    boxes_flat = pred_boxes[0].cpu().tolist()
+    
+    for cls_id, box in zip(kg_class_ids, boxes_flat):
+        cid = int(cls_id)
+        cx, cy, w, h = box
         
-        src_mask = attention_mask.unsqueeze(1).unsqueeze(2) # [B, 1, 1, L_text]
-
-        # 2. Initialize sequences
-        batch_size = 1
-        generated_cls_ids = torch.full((batch_size, 1), model.bos_token_id, dtype=torch.long, device=device)
-        generated_bboxes = torch.zeros((batch_size, 1, 4), dtype=torch.long, device=device) 
-
-        # 3. Autoregressive Loop
-        for step in range(max_elements):
-            current_num_elements = generated_cls_ids.size(1)
-
-            # --- Forward Pass ---
-            layout_embed = model.layout_embedding(generated_cls_ids, generated_bboxes) 
-            trg_mask = generate_square_subsequent_mask(current_num_elements, device=device) # [T, T]
-            
-            # 使用增强后的 text_features
-            decoder_output = model.layout_decoder(layout_embed, text_features, src_mask, trg_mask)
-            
-            # Get predictions for the last element 
-            last_output = decoder_output[:, -1, :] 
-            next_cls_logits = model.cls_head(last_output)
-            
-            # Get BBox Token Logits from 4 heads
-            next_cx_logits = model.cx_head(last_output)
-            next_cy_logits = model.cy_head(last_output)
-            next_w_logits = model.w_head(last_output)
-            next_h_logits = model.h_head(last_output)
-
-            # Greedy selection for classes
-            next_cls_id = next_cls_logits.argmax(dim=-1) # [B] (Internal ID 0-9)
-            
-            # Greedy selection for BBox IDs (Argmax on Logits)
-            next_cx_id = next_cx_logits.argmax(dim=-1) # [B]
-            next_cy_id = next_cy_logits.argmax(dim=-1)
-            next_w_id = next_w_logits.argmax(dim=-1)
-            next_h_id = next_h_logits.argmax(dim=-1)
-            
-            next_bbox_ids = torch.stack([next_cx_id, next_cy_id, next_w_id, next_h_id], dim=1)
-
-            # --- Stopping Condition (EOS) ---
-            # is_eos = (next_cls_id == model.eos_token_id) # 原代码: 使用 ID 1 (现在 ID 1 是元素 2)
-            is_eos = (next_cls_id == 0) # <<< MODIFIED: EOS 对应的内部索引是 0
-            if is_eos.all():
-                break
-
-            # Update sequences (generated_bboxes MUST BE LONG IDs)
-            generated_cls_ids = torch.cat([generated_cls_ids, next_cls_id.unsqueeze(1)], dim=1)
-            generated_bboxes = torch.cat([generated_bboxes, next_bbox_ids.unsqueeze(1)], dim=1) # <--- Use LongTensor IDs
-
-        # 4. Final Extraction and Mapping
-        final_cls_ids = generated_cls_ids[0, 1:] 
-        final_bbox_ids = generated_bboxes[0, 1:] # [N, 4] LongTensor of IDs
-
-        # Detokenize BBox IDs to float coordinates
-        final_bboxes_float = final_bbox_ids.float() / range_divisor # [N, 4] FloatTensor
-
-        layout = []
-        for cls_id_tensor, bbox_float_tensor in zip(final_cls_ids, final_bboxes_float):
-            internal_cls_id = cls_id_tensor.item() # Internal ID (0-9)
-            
-            # if internal_cls_id < 0 or internal_cls_id >= model.num_element_classes: # 原代码: 检查 0-8
-            #     continue 
-            
-            if internal_cls_id == 0: # <<< MODIFIED: Internal ID 0 is EOS
-                continue
-            
-            # original_cls_id = internal_cls_id + 2 # 原代码: internal 1->3
-            original_cls_id = internal_cls_id + 1 # <<< MODIFIED: Map internal 1-9 to original 2-10
-            
-            cx, cy, w, h = bbox_float_tensor.tolist()
-            layout.append((original_cls_id, cx, cy, w, h))
-
-        return layout
+        # === [FIX V5.2] 通用形状约束逻辑 ===
+        # 1. 基础兜底：防止塌缩成点 (至少 2%)
+        w = max(w, 0.02)
+        h = max(h, 0.02)
+        
+        if cid in CLASS_SHAPE_PRIORS:
+            prior = CLASS_SHAPE_PRIORS[cid]
+            if 'min_w' in prior: w = max(w, prior['min_w'])
+            if 'min_h' in prior: h = max(h, prior['min_h'])
+            if 'max_w' in prior: w = min(w, prior['max_w'])
+            if 'max_h' in prior: h = min(h, prior['max_h'])
+        # =================================
+        
+        layout.append((float(cls_id), cx, cy, w, h))
+        
+    return layout

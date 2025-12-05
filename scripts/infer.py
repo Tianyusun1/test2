@@ -1,28 +1,38 @@
+# File: tianyusun1/test2/test2-5.1/scripts/infer.py (V5.4: UPDATED FOR CLUSTERING & JITTER)
+
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
 import os
 
 # 获取当前脚本 (infer.py) 的绝对路径
 current_script_path = os.path.abspath(__file__)
-
-# 修复路径：infer.py 位于 scripts/ 下，所以 project_root 是它的父目录的父目录
 project_root = os.path.dirname(os.path.dirname(current_script_path)) 
-# 将项目根目录插入到 sys.path 的开头
 sys.path.insert(0, project_root)
-# --- 以上三行代码确保能正确导入 models, inference, data 等模块 ---
+# ---------------------------------------------
 
-# --- 现在可以安全地导入项目内部模块 ---
 import torch
+import argparse 
 from transformers import BertTokenizer
 from models.poem2layout import Poem2LayoutGenerator
 from inference.greedy_decode import greedy_decode_poem_layout
 from data.utils import layout_seq_to_yolo_txt
+from data.visualize import draw_layout
 import yaml
 
 def main():
+    # [NEW] 添加命令行参数解析，方便测试多样性
+    parser = argparse.ArgumentParser(description="Inference for Poem2Layout")
+    # [MODIFIED] 默认诗句改为包含数量词的例子，方便验证
+    parser.add_argument("--poem", type=str, default="两只黄鹂鸣翠柳，一行白鹭上青天。", help="Input poem")
+    parser.add_argument("--mode", type=str, default="sample", choices=["greedy", "sample"], help="Decoding mode: 'greedy' for deterministic, 'sample' for diversity (and jitter)")
+    parser.add_argument("--top_k", type=int, default=3, help="Top-K for sampling (only used in sample mode)")
+    # [NEW V4.2] 新增采样次数参数，用于展示 CVAE 的多样性
+    parser.add_argument("--num_samples", type=int, default=3, help="Number of samples to generate per poem (CVAE diversity check)")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to specific checkpoint. If None, uses latest/best in output_dir")
+    args = parser.parse_args()
+
     # 1. Load config
-    # 修复：确保配置文件路径相对于脚本的执行位置
-    config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs/default.yaml")
+    config_path = os.path.join(project_root, "configs/default.yaml")
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
@@ -30,8 +40,8 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # 3. Load model and tokenizer
-    # Note: num_classes 应该已经被修正为 11 (9个元素 + BOS/EOS)
+    # 3. Init model (确保参数与训练时一致)
+    print(f"Initializing model with latent_dim={config['model'].get('latent_dim', 32)}...")
     model = Poem2LayoutGenerator(
         bert_path=config['model']['bert_path'],
         num_classes=config['model']['num_classes'],
@@ -40,51 +50,109 @@ def main():
         decoder_layers=config['model']['decoder_layers'],
         decoder_heads=config['model']['decoder_heads'],
         dropout=config['model']['dropout'],
-        coord_loss_weight=config['model']['coord_loss_weight']
+        
+        # === [NEW] 传入 CVAE 参数 ===
+        latent_dim=config['model'].get('latent_dim', 32), # 必须传入，否则加载权重会报错
+        
+        # === Loss Weights (Inference时不使用，但需占位以匹配 __init__ 签名) ===
+        reg_loss_weight=config['model'].get('reg_loss_weight', 1.0),
+        
+        # [NEW V5.0] Aesthetic Weights Placeholders
+        alignment_loss_weight=config['model'].get('alignment_loss_weight', 0.5),
+        balance_loss_weight=config['model'].get('balance_loss_weight', 0.5),
+        
+        # [NEW V5.4] Clustering Weight Placeholder (匹配新模型签名)
+        clustering_loss_weight=config['model'].get('clustering_loss_weight', 1.0)
     )
 
     # 4. Load checkpoint
-    # 移除硬编码：使用配置中的 output_dir，并要求用户设置 CHECKPOINT_NAME
     output_dir = config['training']['output_dir']
-    CHECKPOINT_NAME = "model_epoch_100.pth" # <<< TODO: 请用户在此设置正确的权重文件名
     
-    checkpoint_path = os.path.join(output_dir, CHECKPOINT_NAME)
-    
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}\n"
-                                f"Please update CHECKPOINT_NAME in infer.py.")
+    if args.checkpoint:
+        checkpoint_path = args.checkpoint
+    else:
+        # 自动查找最佳或最新模型
+        best_model_path = None
+        latest_model_path = None
+        max_epoch = -1
+        
+        if os.path.exists(output_dir):
+            for f in os.listdir(output_dir):
+                if f.endswith('.pth'):
+                    full_path = os.path.join(output_dir, f)
+                    if "best" in f:
+                        best_model_path = full_path
+                    elif "epoch_" in f:
+                        try:
+                            parts = f.split('_')
+                            epoch_idx = parts.index('epoch')
+                            epoch_num = int(parts[epoch_idx+1])
+                            if epoch_num > max_epoch:
+                                max_epoch = epoch_num
+                                latest_model_path = full_path
+                        except:
+                            pass
+        
+        checkpoint_path = best_model_path if best_model_path else latest_model_path
 
-    print(f"Loading model checkpoint from: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    if not checkpoint_path or not os.path.exists(checkpoint_path):
+        print(f"[Warning] No valid checkpoint found in {output_dir}. Please train the model first.")
+        # 这里不 raise error，允许用户在没有 checkpoint 的情况下检查代码跑通（随机初始化）
+    else:
+        print(f"Loading checkpoint: {checkpoint_path}")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+        except RuntimeError as e:
+            print("\n[ERROR] Checkpoint loading failed. This is likely because the model architecture has changed (e.g. latent_dim added).")
+            print("Please DELETE the old checkpoints in 'outputs/' and RETRAIN the model.")
+            raise e
+
     model.to(device)
-    model.eval() # Set to evaluation mode
+    model.eval() 
 
     tokenizer = BertTokenizer.from_pretrained(config['model']['bert_path'])
 
-    # 5. Run inference
-    # 优化：可以从命令行参数读取 poem，这里使用硬编码示例
-    poem = "山色空蒙雨亦奇，小桥流水绕柴扉。"
+    # 5. Run inference loop
+    poem = args.poem
+    print(f"------------------------------------------------")
     print(f"Input poem: {poem}")
+    print(f"Mode: {args.mode} (Top-K: {args.top_k})")
+    print(f"Generating {args.num_samples} sample(s)...")
 
-    # 获取 max_elements
     max_elements = config['model'].get('max_elements', 30)
+    os.makedirs(output_dir, exist_ok=True)
     
-    layout = greedy_decode_poem_layout(
-        model, tokenizer, poem,
-        max_elements=max_elements,
-        device=device
-    )
+    # [NEW] 循环生成多个样本
+    for i in range(args.num_samples):
+        # 每次调用 greedy_decode，CVAE 内部都会重新随机采样 z ~ N(0, I)
+        layout = greedy_decode_poem_layout(
+            model, tokenizer, poem,
+            max_elements=max_elements,
+            device=device.type,
+            mode=args.mode,
+            top_k=args.top_k
+        )
 
-    print("Generated Layout:")
-    for i, (cls_id, cx, cy, w, h) in enumerate(layout):
-        print(f"  {i+1}: Class {cls_id}, (cx={cx:.3f}, cy={cy:.3f}, w={w:.3f}, h={h:.3f})")
+        print(f"\n--- Sample {i+1} Generated Layout ---")
+        for j, (cls_id, cx, cy, w, h) in enumerate(layout):
+            print(f"  {j+1}: Class {int(cls_id)} (cx={cx:.3f}, cy={cy:.3f}, w={w:.3f}, h={h:.3f})")
 
-    # 6. Save layout to YOLO format
-    output_txt_path = os.path.join(output_dir, "predicted_layout.txt")
-    os.makedirs(os.path.dirname(output_txt_path), exist_ok=True) # Ensure output dir exists
-    layout_seq_to_yolo_txt(layout, output_txt_path)
-    print(f"Layout saved to {output_txt_path}")
+        # 6. Save outputs
+        # 文件名增加 sample 编号
+        suffix = f"_{args.mode}"
+        if args.num_samples > 1:
+            suffix += f"_sample{i+1}"
+            
+        output_txt_path = os.path.join(output_dir, f"predicted_layout{suffix}.txt")
+        layout_seq_to_yolo_txt(layout, output_txt_path)
+        print(f"-> Text layout saved to {output_txt_path}")
+
+        output_png_path = os.path.join(output_dir, f"predicted_layout{suffix}.png")
+        draw_layout(layout, f"PRED ({args.mode} #{i+1}): {poem}", output_png_path)
+        print(f"-> Visualization saved to {output_png_path}")
+
+    print(f"------------------------------------------------")
 
 if __name__ == "__main__":
     main()
