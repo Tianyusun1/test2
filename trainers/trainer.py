@@ -167,11 +167,13 @@ class LayoutTrainer:
         
         # --- 策略 B: KL Annealing (V5.2: Early Intervention) ---
         
-        target_kl = 0.01
+        # [MODIFIED] 降低目标 KL 权重，并延长退火周期
+        target_kl = 0.005 # 原始为 0.01，降低目标值
         
         # [MODIFIED V5.2] 提早介入 KL Loss (Epoch 5)，防止 Posterior Collapse
         kl_transition_start = 5
-        kl_transition_duration = 50 # 5 -> 55 快速上升，强迫模型使用 z
+        # [MODIFIED] 延长退火周期，从 50 延长到 150 Epoch
+        kl_transition_duration = 150 # 原始为 50。延长退火至 Epoch 155 (5 + 150)
         
         if epoch < kl_transition_start:
             kl_weight = 0.0

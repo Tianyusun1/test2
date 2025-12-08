@@ -1,10 +1,9 @@
-# File: tianyusun1/test2/test2-5.1/scripts/infer.py (V5.4: UPDATED FOR CLUSTERING & JITTER)
+# File: tianyusun1/test2/test2-5.2/scripts/infer.py (V5.7 → V5.8: BATCH INFERENCE FOR 50 POEMS)
 
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
 import os
 
-# 获取当前脚本 (infer.py) 的绝对路径
 current_script_path = os.path.abspath(__file__)
 project_root = os.path.dirname(os.path.dirname(current_script_path)) 
 sys.path.insert(0, project_root)
@@ -18,30 +17,124 @@ from inference.greedy_decode import greedy_decode_poem_layout
 from data.utils import layout_seq_to_yolo_txt
 from data.visualize import draw_layout
 import yaml
+import re
+import string
+
+# --- 50 句古代诗句（已清洗，含具体描绘）---
+POEMS_50 = [
+    "白日依山尽，黄河入海流。",
+    "明月松间照，清泉石上流。",
+    "野旷天低树，江清月近人。",
+    "两岸青山相对出，孤帆一片日边来。",
+    "孤舟蓑笠翁，独钓寒江雪。",
+    "大漠孤烟直，长河落日圆。",
+    "山高月小，水落石出。",
+    "月落乌啼霜满天，江枫渔火对愁眠。",
+    "落霞与孤鹜齐飞，秋水共长天一色。",
+    "渭城朝雨浥轻尘，客舍青青柳色新。",
+    "千山鸟飞绝，万径人踪灭。",
+    "小楼一夜听春雨，深巷明朝卖杏花。",
+    "竹喧归浣女，莲动下渔舟。",
+    "云想衣裳花想容，春风拂槛露华浓。",
+    "独在异乡为异客，每逢佳节倍思亲。",
+    "江流天地外，山色有无中。",
+    "青山横北郭，白水绕东城。",
+    "柴门闻犬吠，风雪夜归人。",
+    "空山新雨后，天气晚来秋。",
+    "一水护田将绿绕，两山排闼送青来.",
+    "接天莲叶无穷碧，映日荷花别样红。",
+    "黄河远上白云间，一片孤城万仞山.",
+    "山回路转不见君，雪上空留马行处.",
+    "西塞山前白鹭飞，桃花流水鳜鱼肥.",
+    "日出江花红胜火，春来江水绿如蓝.",
+    "两岸猿声啼不住，轻舟已过万重山.",
+    "溪云初起日沉阁，山雨欲来风满楼.",
+    "鸡声茅店月，人迹板桥霜.",
+    "林表明霁色，城中增暮寒.",
+    "清明时节雨纷纷，路上行人欲断魂.",
+    "轻舟短棹西湖好，绿水逶迤，芳草长堤.",
+    "山光悦鸟性，潭影空人心.",
+    "绿树村边合，青山郭外斜.",
+    "霜落熊升树，林空鹿饮溪.",
+    "千峰笋石千株玉，万树松萝万朵云.",
+    "烟波江上使人愁。",
+    "渔舟逐水爱山春，两岸桃花夹古津.",
+    "楼观沧海日，门对浙江潮.",
+    "松风吹解带，山月照弹琴.",
+    "野渡无人舟自横.",
+    "湖光秋月两相和，潭面无风镜未磨.",
+    "江碧鸟逾白，山青花欲燃.",
+    "石泉流暗壁，草露滴秋根.",
+    "晓看红湿处，花重锦官城.",
+    "榆柳荫后檐，桃李罗堂前.",
+    "木末芙蓉花，山中发红萼.",
+    "露从今夜白，月是故乡明.",
+    "萧萧梧叶送寒声，江上秋风动客情.",
+    "山寺月中寻桂子，郡亭枕上看潮头.",
+    "横看成岭侧成峰，远近高低各不同."
+]
+
+def sanitize_filename(text, max_len=30):
+    """将诗句转换为安全的文件名（移除标点、空格，截断）"""
+    # 移除标点和特殊字符
+    valid_chars = "-_.() %s%s" % (string.ascii_letters, string.digits)
+    cleaned = ''.join(c for c in text if c in valid_chars or '\u4e00' <= c <= '\u9fff')  # 保留中英文
+    cleaned = cleaned.replace(' ', '_').replace('　', '_')
+    # 截断并去除首尾下划线
+    return cleaned[:max_len].strip('_').replace('__', '_') or "poem"
+
+def find_best_checkpoint(output_dir):
+    if not os.path.exists(output_dir):
+        return None
+    files = [f for f in os.listdir(output_dir) if f.endswith('.pth')]
+    rl_checkpoints = []
+    for f in files:
+        if "rl_finetuned" in f:
+            match = re.search(r'epoch_(\d+)', f)
+            if match:
+                epoch_num = int(match.group(1))
+                rl_checkpoints.append((epoch_num, os.path.join(output_dir, f)))
+    if rl_checkpoints:
+        rl_checkpoints.sort(key=lambda x: x[0], reverse=True)
+        print(f"[Auto-Resume] Found RL finetuned model: {rl_checkpoints[0][1]}")
+        return rl_checkpoints[0][1]
+    best_models = [f for f in files if "best_val_loss" in f]
+    if best_models:
+        print(f"[Auto-Resume] Found Best Val Loss model: {os.path.join(output_dir, best_models[0])}")
+        return os.path.join(output_dir, best_models[0])
+    epoch_models = []
+    for f in files:
+        if "model_epoch_" in f and "rl" not in f:
+            match = re.search(r'epoch_(\d+)', f)
+            if match:
+                epoch_num = int(match.group(1))
+                epoch_models.append((epoch_num, os.path.join(output_dir, f)))
+    if epoch_models:
+        epoch_models.sort(key=lambda x: x[0], reverse=True)
+        print(f"[Auto-Resume] Found latest supervised model: {epoch_models[0][1]}")
+        return epoch_models[0][1]
+    return None
 
 def main():
-    # [NEW] 添加命令行参数解析，方便测试多样性
-    parser = argparse.ArgumentParser(description="Inference for Poem2Layout")
-    # [MODIFIED] 默认诗句改为包含数量词的例子，方便验证
-    parser.add_argument("--poem", type=str, default="两只黄鹂鸣翠柳，一行白鹭上青天。", help="Input poem")
-    parser.add_argument("--mode", type=str, default="sample", choices=["greedy", "sample"], help="Decoding mode: 'greedy' for deterministic, 'sample' for diversity (and jitter)")
-    parser.add_argument("--top_k", type=int, default=3, help="Top-K for sampling (only used in sample mode)")
-    # [NEW V4.2] 新增采样次数参数，用于展示 CVAE 的多样性
-    parser.add_argument("--num_samples", type=int, default=3, help="Number of samples to generate per poem (CVAE diversity check)")
-    parser.add_argument("--checkpoint", type=str, default=None, help="Path to specific checkpoint. If None, uses latest/best in output_dir")
+    parser = argparse.ArgumentParser(description="Batch Inference for 50 Ancient Poems")
+    parser.add_argument("--poem", type=str, default=None, help="Single poem for inference (optional)")
+    parser.add_argument("--mode", type=str, default="sample", choices=["greedy", "sample"], help="Decoding mode")
+    parser.add_argument("--top_k", type=int, default=3, help="Top-K for sampling")
+    parser.add_argument("--num_samples", type=int, default=3, help="Number of samples per poem")
+    parser.add_argument("--checkpoint", type=str, default="/home/sty/pyfile/Layout2Paint5.3.1/outputs/rl_finetuned_epoch_50.pth", help="Path to specific checkpoint")
     args = parser.parse_args()
 
-    # 1. Load config
+    # Load config
     config_path = os.path.join(project_root, "configs/default.yaml")
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
-    # 2. Determine device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # 3. Init model (确保参数与训练时一致)
-    print(f"Initializing model with latent_dim={config['model'].get('latent_dim', 32)}...")
+    # Init model
+    latent_dim = config['model'].get('latent_dim', 32)
+    print(f"Initializing model with latent_dim={latent_dim}...")
     model = Poem2LayoutGenerator(
         bert_path=config['model']['bert_path'],
         num_classes=config['model']['num_classes'],
@@ -50,109 +143,78 @@ def main():
         decoder_layers=config['model']['decoder_layers'],
         decoder_heads=config['model']['decoder_heads'],
         dropout=config['model']['dropout'],
-        
-        # === [NEW] 传入 CVAE 参数 ===
-        latent_dim=config['model'].get('latent_dim', 32), # 必须传入，否则加载权重会报错
-        
-        # === Loss Weights (Inference时不使用，但需占位以匹配 __init__ 签名) ===
-        reg_loss_weight=config['model'].get('reg_loss_weight', 1.0),
-        
-        # [NEW V5.0] Aesthetic Weights Placeholders
-        alignment_loss_weight=config['model'].get('alignment_loss_weight', 0.5),
-        balance_loss_weight=config['model'].get('balance_loss_weight', 0.5),
-        
-        # [NEW V5.4] Clustering Weight Placeholder (匹配新模型签名)
+        latent_dim=latent_dim,
         clustering_loss_weight=config['model'].get('clustering_loss_weight', 1.0)
     )
 
-    # 4. Load checkpoint
-    output_dir = config['training']['output_dir']
-    
+    # Load checkpoint
     if args.checkpoint:
         checkpoint_path = args.checkpoint
     else:
-        # 自动查找最佳或最新模型
-        best_model_path = None
-        latest_model_path = None
-        max_epoch = -1
-        
-        if os.path.exists(output_dir):
-            for f in os.listdir(output_dir):
-                if f.endswith('.pth'):
-                    full_path = os.path.join(output_dir, f)
-                    if "best" in f:
-                        best_model_path = full_path
-                    elif "epoch_" in f:
-                        try:
-                            parts = f.split('_')
-                            epoch_idx = parts.index('epoch')
-                            epoch_num = int(parts[epoch_idx+1])
-                            if epoch_num > max_epoch:
-                                max_epoch = epoch_num
-                                latest_model_path = full_path
-                        except:
-                            pass
-        
-        checkpoint_path = best_model_path if best_model_path else latest_model_path
+        output_dir = config['training']['output_dir']
+        checkpoint_path = find_best_checkpoint(output_dir)
 
     if not checkpoint_path or not os.path.exists(checkpoint_path):
-        print(f"[Warning] No valid checkpoint found in {output_dir}. Please train the model first.")
-        # 这里不 raise error，允许用户在没有 checkpoint 的情况下检查代码跑通（随机初始化）
+        print(f"[Warning] No valid checkpoint found. Running with random weights.")
     else:
         print(f"Loading checkpoint: {checkpoint_path}")
         try:
             checkpoint = torch.load(checkpoint_path, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
+            state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+            model.load_state_dict(state_dict)
+            print("✅ Model loaded successfully.")
         except RuntimeError as e:
-            print("\n[ERROR] Checkpoint loading failed. This is likely because the model architecture has changed (e.g. latent_dim added).")
-            print("Please DELETE the old checkpoints in 'outputs/' and RETRAIN the model.")
-            raise e
+            print(f"\n[ERROR] Checkpoint loading failed: {e}")
+            print("Tip: Check if 'latent_dim' in config matches the trained model.")
+            return
 
     model.to(device)
-    model.eval() 
-
+    model.eval()
     tokenizer = BertTokenizer.from_pretrained(config['model']['bert_path'])
 
-    # 5. Run inference loop
-    poem = args.poem
-    print(f"------------------------------------------------")
-    print(f"Input poem: {poem}")
-    print(f"Mode: {args.mode} (Top-K: {args.top_k})")
-    print(f"Generating {args.num_samples} sample(s)...")
+    # 确定要处理的诗句列表
+    if args.poem:
+        poems_to_process = [args.poem]
+    else:
+        poems_to_process = POEMS_50
 
-    max_elements = config['model'].get('max_elements', 30)
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # [NEW] 循环生成多个样本
-    for i in range(args.num_samples):
-        # 每次调用 greedy_decode，CVAE 内部都会重新随机采样 z ~ N(0, I)
-        layout = greedy_decode_poem_layout(
-            model, tokenizer, poem,
-            max_elements=max_elements,
-            device=device.type,
-            mode=args.mode,
-            top_k=args.top_k
-        )
-
-        print(f"\n--- Sample {i+1} Generated Layout ---")
-        for j, (cls_id, cx, cy, w, h) in enumerate(layout):
-            print(f"  {j+1}: Class {int(cls_id)} (cx={cx:.3f}, cy={cy:.3f}, w={w:.3f}, h={h:.3f})")
-
-        # 6. Save outputs
-        # 文件名增加 sample 编号
-        suffix = f"_{args.mode}"
-        if args.num_samples > 1:
-            suffix += f"_sample{i+1}"
-            
-        output_txt_path = os.path.join(output_dir, f"predicted_layout{suffix}.txt")
-        layout_seq_to_yolo_txt(layout, output_txt_path)
-        print(f"-> Text layout saved to {output_txt_path}")
-
-        output_png_path = os.path.join(output_dir, f"predicted_layout{suffix}.png")
-        draw_layout(layout, f"PRED ({args.mode} #{i+1}): {poem}", output_png_path)
-        print(f"-> Visualization saved to {output_png_path}")
+    save_dir = config['training']['output_dir']
+    os.makedirs(save_dir, exist_ok=True)
 
     print(f"------------------------------------------------")
+    print(f"Starting batch inference for {len(poems_to_process)} poem(s)...")
+    print(f"Mode: {args.mode} | Top-K: {args.top_k} | Samples per poem: {args.num_samples}")
+    print(f"Results will be saved to: {save_dir}")
+    print(f"------------------------------------------------")
+
+    for idx, poem in enumerate(poems_to_process, 1):
+        print(f"\n[Poem {idx}/{len(poems_to_process)}] {poem}")
+        poem_safe_name = sanitize_filename(poem, max_len=25)
+
+        for sample_idx in range(args.num_samples):
+            layout = greedy_decode_poem_layout(
+                model, tokenizer, poem,
+                max_elements=config['model'].get('max_elements', 30),
+                device=device.type,
+                mode=args.mode,
+                top_k=args.top_k
+            )
+
+            # 构建唯一文件名
+            suffix = f"_{args.mode}"
+            if args.num_samples > 1:
+                suffix += f"_sample{sample_idx+1}"
+            file_base = f"poem{idx:02d}_{poem_safe_name}{suffix}"
+
+            output_txt_path = os.path.join(save_dir, f"{file_base}.txt")
+            output_png_path = os.path.join(save_dir, f"{file_base}.png")
+
+            layout_seq_to_yolo_txt(layout, output_txt_path)
+            draw_layout(layout, f"{args.mode.capitalize()} Inference: {poem}", output_png_path)
+
+            print(f"  → Saved: {file_base}.png")
+
+    print(f"\n✅ Batch inference completed! All results saved in: {save_dir}")
 
 if __name__ == "__main__":
     main()

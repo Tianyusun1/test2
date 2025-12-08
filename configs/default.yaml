@@ -1,12 +1,11 @@
-# File: tianyusun1/test2/test2-5.1/configs/default.yaml (V5.4: +CLUSTERING LOSS)
-#5.2版本引入数量问题
+# File: tianyusun1/test2/test2-5.1/configs/default.yaml (V5.5: OPTIMIZED FOR 6K DATA & LARGE GPU)
 
 model:
   # BERT encoder
-  bert_path: "/home/610-sty/huggingface/bert-base-chinese"
+  bert_path: "/home/sty/pyfile/huggingface/bert-base-chinese"
   hidden_size: 768
   # Layout decoder
-  bb_size: 128            # 保持 V5.3 的高维度
+  bb_size: 128            # 保持高维度，显存够大没问题
   decoder_layers: 6
   decoder_heads: 8
   dropout: 0.3
@@ -14,33 +13,29 @@ model:
   num_classes: 9
   
   # === CVAE Parameters ===
-  latent_dim: 32  
-  
+  latent_dim: 64          # [Confirmed] 使用 64 维潜在空间增强多样性
+
   # --- Legacy Discrete Parameters ---
   num_bbox_bins: 1000
   cls_embed_dim: 32
   bbox_embed_dim: 24
   # -----------------------------------------------------------
 
-  # === LOSS WEIGHTS (INITIAL VALUES FOR CURRICULUM) ===
-  # Trainer 会动态调整 reg/rel/overlap 权重。
-  
+  # === LOSS WEIGHTS (SUPERVISED STAGE) ===
   # 1. 基础重建
-  reg_loss_weight: 1.0      # [CURRICULUM] 初始 1.0 -> 后期 5.0
+  reg_loss_weight: 1.0      
   iou_loss_weight: 1.0      
   area_loss_weight: 1.0     
   
-  # 2. 逻辑与空间约束
-  relation_loss_weight: 5.0 # [CURRICULUM] 初始 5.0 -> 后期 1.0
+  # 2. 逻辑与空间约束 (KG增强)
+  relation_loss_weight: 5.0 
   overlap_loss_weight: 3.0  
   size_loss_weight: 2.0     
   
-  # 3. [NEW V5.4] 聚类约束 (Clustering Loss)
-  # 防止同类物体（如两只鸟）散列太远。权重设为 1.0 作为起始尝试。
+  # 3. 聚类约束 (Clustering)
   clustering_loss_weight: 1.0
   
-  # 4. 审美约束 (Aesthetic Losses)
-  # 暂时关闭，优先保证生成的物体数量和聚类正确。
+  # 4. 审美约束 (Aesthetic) - 监督阶段建议设为 0 或很小，交给 RL 去优化
   alignment_loss_weight: 0.0 
   balance_loss_weight: 0.0   
   
@@ -52,22 +47,45 @@ model:
   # Inference
   max_elements: 30
   
-  # Data paths
-  xlsx_path: "/home/610-sty/Layout2Paint/dataset/6800poems.xlsx"
-  images_dir: "/home/610-sty/Layout2Paint/dataset/6800"
-  labels_dir: "/home/610-sty/Layout2Paint/dataset/6800/JPEGImages-pre_new_txt"
+  # Data paths (Updated)
+  xlsx_path: "/home/sty/pyfile/Layout2Paint5.3.1/dataset/6800poems.xlsx"
+  images_dir: "/home/sty/pyfile/Layout2Paint5.3.1/dataset/6800"
+  labels_dir: "/home/sty/pyfile/Layout2Paint5.3.1/dataset/6800/JPEGImages-pre_new_txt"
   max_layout_length: 30
   max_text_length: 64
 
 training:
-  batch_size: 16
-  epochs: 200             
+  # === Stage 1: Supervised Pre-training ===
+  batch_size: 128         # [Modified] 显存大就开大，由 64 -> 128
+  epochs: 200             # [Modified] 6000张图数据量较小，增加轮数以保证收敛
   learning_rate: 0.0001
-  warmup_steps: 1000
-  save_every: 50
-  output_dir: "./outputs"
+  warmup_steps: 1000      # 约 20 个 Epoch 的 Warmup (1000 / 47)
+  
+  # Logging & Saving
+  save_every: 50          # 每 50 轮存一次检查点
+  output_dir: "./outputs/rl"
   log_steps: 10
-  visualize_every: 1      # 保持高频可视化以便观察 "Epoch X Layout Pred"
+  visualize_every: 5      # [Modified] 200轮太多了，每5轮画一次图即可，避免刷屏
+
+  # === Stage 2: RL Fine-tuning Configuration ===
+  # 这些参数将在 scripts/train.py 中被读取用于 RL 阶段
+  rl_epochs: 50           # [NEW] RL 微调轮数
+  rl_learning_rate: 5e-6  # [NEW] RL 学习率 (通常比 SL 低 1-2 个数量级)
+  
+  # RL Rewards Weights (可以在这里集中管理)
+  reward_weights:
+    iou: 2.0              # 稳住有标注的数据
+    relation: 1.5         # 核心：奖励符合 KG 逻辑的无标注物体
+    dispersion: 0.8       # 核心：奖励分散布局，解决中心堆积
+    overlap: -0.5         # 惩罚重叠
 
 inference:
   max_output_length: 30
+
+
+#python scripts/train.py
+# python scripts/train.py \
+#     --rl_tuning \
+#     --checkpoint /home/sty/pyfile/Layout2Paint5.3.1/outputs/model_epoch_200_val_loss_0.9073.pth
+
+#python scripts/infer.py --num_samples 5 --mode sample

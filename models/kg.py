@@ -15,7 +15,7 @@ class PoetryKnowledgeGraph:
         # === 1. 初始化 LTP (加载本地模型) ===
         if LTP is not None:
             # 指定您的本地模型路径
-            local_model_path = "/home/610-sty/huggingface/ltp"
+            local_model_path = "/home/sty/pyfile/huggingface/ltp"
             
             print(f"正在加载本地 LTP 模型: {local_model_path} ...")
             try:

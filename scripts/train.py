@@ -1,8 +1,9 @@
-# File: tianyusun1/test2/test2-5.1/scripts/train.py (V5.4: CLUSTERING LOSS INTEGRATION)
+# File: tianyusun1/test2/test2-5.2/scripts/train.py (V5.8: FIXED TYPE ERROR & ADDED VISUALIZATION)
 
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
 import os
+import argparse 
 
 # 获取当前脚本 (train.py) 的绝对路径
 current_script_path = os.path.abspath(__file__)
@@ -19,6 +20,7 @@ from transformers import BertTokenizer
 from data.dataset import PoegraphLayoutDataset, layout_collate_fn 
 from models.poem2layout import Poem2LayoutGenerator
 import trainers 
+from trainers.rl_trainer import RLTrainer 
 from collections import Counter
 import numpy as np 
 
@@ -84,6 +86,12 @@ def compute_class_weights(dataset, num_classes: int, max_weight_ratio: float = 3
 
 
 def main():
+    # [NEW] 添加命令行参数解析
+    parser = argparse.ArgumentParser(description="Train or RL-Finetune Poem2Layout")
+    parser.add_argument('--rl_tuning', action='store_true', help="Enable Reinforcement Learning fine-tuning mode")
+    parser.add_argument('--checkpoint', type=str, default=None, help="Path to pretrained model checkpoint (required for RL tuning)")
+    args = parser.parse_args()
+
     # 1. Load config
     config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs/default.yaml")
     with open(config_path, "r") as f:
@@ -91,6 +99,7 @@ def main():
 
     # 2. Init tokenizer and load FULL dataset for weight calculation
     model_config = config['model']
+    train_config = config['training'] # 获取 training 配置块
     
     # 重新初始化数据集以确保数据完整性
     dataset = PoegraphLayoutDataset(
@@ -162,24 +171,33 @@ def main():
     )
     print(f"Dataset split: Train={train_size}, Validation={val_size}, Test={test_size}")
 
+    # [NOTE] Batch Size 读取自配置文件，请确保 yaml 中 batch_size 已设置为 128
+    batch_size = train_config['batch_size']
+    print(f"Using Batch Size: {batch_size}")
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config['training']['batch_size'],
+        batch_size=batch_size,
         shuffle=True,
-        collate_fn=layout_collate_fn 
+        collate_fn=layout_collate_fn,
+        num_workers=4, # 大批量数据建议开启多线程加载
+        pin_memory=True
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config['training']['batch_size'],
+        batch_size=batch_size,
         shuffle=False,
-        collate_fn=layout_collate_fn 
+        collate_fn=layout_collate_fn,
+        num_workers=4,
+        pin_memory=True
     )
-    # 增加测试集加载器
     test_loader = DataLoader(
         test_dataset,
-        batch_size=config['training']['batch_size'],
+        batch_size=batch_size,
         shuffle=False,
-        collate_fn=layout_collate_fn 
+        collate_fn=layout_collate_fn,
+        num_workers=4,
+        pin_memory=True
     )
     
     # --- 获取 tokenizer 和一个固定样例 ---
@@ -204,10 +222,66 @@ def main():
     print(kg_spatial_matrix_example)
     print("---------------------------------------------------\n")
 
-    # 5. Init trainer and start training
-    # 将 test_loader 传递给 Trainer
-    trainer = trainers.LayoutTrainer(model, train_loader, val_loader, config, tokenizer, example_poem, test_loader)
-    trainer.train()
+    # 5. Logic Branch: RL Tuning OR Supervised Training
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    if args.rl_tuning:
+        print("\n=======================================================")
+        print(">>> ENTERING RL FINE-TUNING MODE (SCST) <<<")
+        print("=======================================================\n")
+        
+        # 1. 必须加载预训练模型
+        if args.checkpoint is None:
+            raise ValueError("RL tuning requires a pretrained checkpoint! Use --checkpoint")
+        
+        print(f"Loading pretrained model from {args.checkpoint}...")
+        # map_location 确保在 CPU/GPU 间迁移兼容
+        checkpoint = torch.load(args.checkpoint, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # 2. 读取 RL 配置参数 [FIXED: 强制类型转换]
+        # 务必转为 float 和 int，防止 YAML 解析为 string 导致 optimizer 报错
+        rl_lr = float(train_config.get('rl_learning_rate', 5e-6))
+        rl_epochs = int(train_config.get('rl_epochs', 50))
+        
+        print(f"RL Config -> Learning Rate: {rl_lr:.2e} (float) | Epochs: {rl_epochs} (int)")
+
+        # 3. 初始化 RLTrainer
+        trainer = RLTrainer(model, train_loader, val_loader, config, tokenizer, example_poem, test_loader)
+        
+        # 4. 强制覆盖优化器的学习率
+        for param_group in trainer.optimizer.param_groups:
+            param_group['lr'] = rl_lr
+        
+        # 5. 开始 RL 训练循环
+        for epoch in range(rl_epochs):
+            trainer.train_rl_epoch(epoch)
+            
+            # [NEW] 可视化：每轮 RL 结束生成一张样例图，直观看到模型变化
+            print(f"--- Visualizing RL Progress (Epoch {epoch+1}) ---")
+            # 调用 Trainer 内部的推理函数，它会生成 png 到 outputs/
+            trainer._run_inference_example(epoch)
+            
+            # 每轮结束后验证一次并保存
+            if (epoch + 1) % 1 == 0:
+                # avg_val_loss = trainer.validate(epoch) # 可选：RL阶段验证集Loss参考意义不大
+                
+                rl_save_path = os.path.join(train_config['output_dir'], f"rl_finetuned_epoch_{epoch+1}.pth")
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'epoch': epoch,
+                    'optimizer_state_dict': trainer.optimizer.state_dict(),
+                    'rl_config': {'lr': rl_lr}
+                }, rl_save_path)
+                print(f"-> RL Checkpoint saved to {rl_save_path}")
+                
+    else:
+        # 原有的监督训练逻辑
+        print(">>> Starting Standard Supervised Training <<<")
+        print(f"Total Epochs: {train_config['epochs']} | Batch Size: {batch_size}")
+        
+        trainer = trainers.LayoutTrainer(model, train_loader, val_loader, config, tokenizer, example_poem, test_loader)
+        trainer.train()
 
 if __name__ == "__main__":
     main()

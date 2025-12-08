@@ -39,7 +39,7 @@ class PoegraphLayoutDataset(Dataset):
         self,
         xlsx_path: str,
         labels_dir: str,
-        bert_model_path: str = "/home/610-sty/huggingface/bert-base-chinese",
+        bert_model_path: str = "/home/sty/pyfile/huggingface/bert-base-chinese",
         max_layout_length: int = 30, 
         max_text_length: int = 64, 
         preload: bool = False

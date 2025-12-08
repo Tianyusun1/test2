@@ -1,4 +1,4 @@
-# models/poem2layout.py (V5.5: FIXED LOSS INDEXING BUG)
+# models/poem2layout.py (V5.6: ADDED RL SUPPORT)
 
 import torch
 import torch.nn as nn
@@ -314,6 +314,50 @@ class Poem2LayoutGenerator(nn.Module):
         pred_boxes = torch.sigmoid(self.reg_head(decoder_output))
         
         return mu, logvar, pred_boxes, decoder_output
+
+    def forward_rl(self, input_ids, attention_mask, kg_class_ids, padding_mask, 
+                   kg_spatial_matrix=None, location_grids=None, target_boxes=None, 
+                   sample=True):
+        """
+        RL 专用的前向传播。
+        Treats the network output as the Mean of a Gaussian policy.
+        """
+        # 1. 复用原有的 forward 获取确定性的预测值 (作为 Gaussian 的均值 mu)
+        # 注意：这里我们不需要 target_boxes 来计算 VAE loss，只需生成
+        # forward 返回: mu, logvar, pred_boxes, decoder_output
+        _, _, pred_boxes_mu, _ = self.forward(
+            input_ids, attention_mask, kg_class_ids, padding_mask, 
+            kg_spatial_matrix, location_grids, target_boxes=None
+        )
+        
+        # pred_boxes_mu: [B, T, 4] (sigmoid 后的 0-1 值)
+
+        if not sample:
+            # Greedy 模式 (Baseline): 直接返回均值，不需要 log_prob
+            return pred_boxes_mu, None
+
+        # 2. 构建高斯分布进行采样 (Exploration)
+        # 设定一个固定的探索方差，例如 0.1 (可以根据需要调整)
+        std = torch.ones_like(pred_boxes_mu) * 0.1
+        dist = torch.distributions.Normal(pred_boxes_mu, std)
+        
+        # 3. 采样动作 (Action)
+        action_boxes = dist.sample()
+        
+        # 4. 截断到 [0, 1] 范围 (因为是 Box 坐标)
+        action_boxes = torch.clamp(action_boxes, 0.0, 1.0)
+        
+        # 5. 计算 Log Probability (用于梯度回传)
+        # Sum over the last dimension (x,y,w,h) -> [B, T]
+        # 注意: clamp 可能会影响 log_prob 的准确性，但在简单应用中通常忽略边界效应
+        log_prob = dist.log_prob(action_boxes).sum(dim=-1)
+        
+        # Mask 掉 Padding 的部分
+        if padding_mask is not None:
+             # padding_mask 为 True 的地方 log_prob 设为 0
+             log_prob = log_prob.masked_fill(padding_mask, 0.0)
+
+        return action_boxes, log_prob
 
     def get_loss(self, pred_cls, pred_bbox_ids, pred_boxes, pred_count, layout_seq, layout_mask, num_boxes, target_coords_gt=None, kg_spatial_matrix=None, kg_class_weights=None, kg_class_ids=None):
         loss_mask = layout_mask 
