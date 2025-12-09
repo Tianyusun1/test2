@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-5.2/scripts/train.py (V5.8: FIXED TYPE ERROR & ADDED VISUALIZATION)
+# File: tianyusun1/test2/test2-5.2/scripts/train.py (V5.9: RL Save Logic Updated)
 
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
@@ -253,27 +253,43 @@ def main():
         for param_group in trainer.optimizer.param_groups:
             param_group['lr'] = rl_lr
         
+        # [NEW] 初始化最佳奖励记录
+        best_reward = -float('inf')
+
         # 5. 开始 RL 训练循环
         for epoch in range(rl_epochs):
-            trainer.train_rl_epoch(epoch)
+            # [MODIFIED] 接收 train_rl_epoch 返回的 avg_reward
+            avg_reward = trainer.train_rl_epoch(epoch)
             
             # [NEW] 可视化：每轮 RL 结束生成一张样例图，直观看到模型变化
             print(f"--- Visualizing RL Progress (Epoch {epoch+1}) ---")
             # 调用 Trainer 内部的推理函数，它会生成 png 到 outputs/
             trainer._run_inference_example(epoch)
             
-            # 每轮结束后验证一次并保存
-            if (epoch + 1) % 1 == 0:
-                # avg_val_loss = trainer.validate(epoch) # 可选：RL阶段验证集Loss参考意义不大
-                
+            # === [NEW] 保存逻辑 A: 保存最棒的模型 (Best Reward) ===
+            if avg_reward > best_reward:
+                best_reward = avg_reward
+                best_save_path = os.path.join(train_config['output_dir'], "rl_best_reward.pth")
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'epoch': epoch,
+                    'avg_reward': avg_reward,
+                    'optimizer_state_dict': trainer.optimizer.state_dict(),
+                    'rl_config': {'lr': rl_lr}
+                }, best_save_path)
+                print(f"🌟 [New Best] Avg Reward {avg_reward:.4f} achieved! Model saved to {best_save_path}")
+
+            # === [MODIFIED] 保存逻辑 B: 每 10 个 Epoch 保存一次 ===
+            if (epoch + 1) % 10 == 0:
                 rl_save_path = os.path.join(train_config['output_dir'], f"rl_finetuned_epoch_{epoch+1}.pth")
                 torch.save({
                     'model_state_dict': model.state_dict(),
                     'epoch': epoch,
+                    'avg_reward': avg_reward,
                     'optimizer_state_dict': trainer.optimizer.state_dict(),
                     'rl_config': {'lr': rl_lr}
                 }, rl_save_path)
-                print(f"-> RL Checkpoint saved to {rl_save_path}")
+                print(f"💾 [Checkpoint] Epoch {epoch+1} saved to {rl_save_path}")
                 
     else:
         # 原有的监督训练逻辑

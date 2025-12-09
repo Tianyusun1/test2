@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-5.1/configs/default.yaml (V5.5: OPTIMIZED FOR 6K DATA & LARGE GPU)
+# File: tianyusun1/test2/test2-5.2/configs/default.yaml (V5.6: Updated RL Params)
 
 model:
   # BERT encoder
@@ -69,19 +69,18 @@ training:
 
   # === Stage 2: RL Fine-tuning Configuration ===
   # 这些参数将在 scripts/train.py 中被读取用于 RL 阶段
-  rl_epochs: 50           # [NEW] RL 微调轮数
+  rl_epochs: 200          # [NEW] RL 微调轮数
   rl_learning_rate: 5e-6  # [NEW] RL 学习率 (通常比 SL 低 1-2 个数量级)
   
   # RL Rewards Weights (可以在这里集中管理)
   reward_weights:
     iou: 2.0              # 稳住有标注的数据
     relation: 1.5         # 核心：奖励符合 KG 逻辑的无标注物体
-    dispersion: 0.8       # 核心：奖励分散布局，解决中心堆积
+    dispersion: 3.0       # 核心：奖励分散布局，解决中心堆积
     overlap: -0.5         # 惩罚重叠
 
 inference:
   max_output_length: 30
-
 
 #python scripts/train.py
 # python scripts/train.py \

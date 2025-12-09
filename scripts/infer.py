@@ -121,7 +121,7 @@ def main():
     parser.add_argument("--mode", type=str, default="sample", choices=["greedy", "sample"], help="Decoding mode")
     parser.add_argument("--top_k", type=int, default=3, help="Top-K for sampling")
     parser.add_argument("--num_samples", type=int, default=3, help="Number of samples per poem")
-    parser.add_argument("--checkpoint", type=str, default="/home/sty/pyfile/Layout2Paint5.3.1/outputs/rl_finetuned_epoch_50.pth", help="Path to specific checkpoint")
+    parser.add_argument("--checkpoint", type=str, default="/home/sty/pyfile/Layout2Paint5.3.1/outputs/rl/rl_finetuned_epoch_110.pth", help="Path to specific checkpoint")
     args = parser.parse_args()
 
     # Load config
