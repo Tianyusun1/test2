@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-5.2/trainers/rl_trainer.py (V5.13: Fixed Broadcasting Bug)
+# File: tianyusun1/test2/test2-5.2/trainers/rl_trainer.py (V5.14: Mixed Training + Stricter Constraints)
 
 import torch
 import torch.nn.functional as F
@@ -13,6 +13,9 @@ class RLTrainer(LayoutTrainer):
     强化学习训练器 (RL Fine-tuning Trainer)。
     继承自 LayoutTrainer，复用了验证、保存模型等逻辑，
     但重写了训练循环以支持 SCST (Self-Critical Sequence Training)。
+    [V5.14 Updates] 
+    1. 引入 Mixed Training (RL + Supervised) 防止尺寸崩坏和灾难性遗忘。
+    2. 增强 Border Penalty 防止物体贴边（左上/右下扎堆）。
     """
     def __init__(self, model, train_loader, val_loader, config, tokenizer, example_poem, test_loader):
         super().__init__(model, train_loader, val_loader, config, tokenizer, example_poem, test_loader)
@@ -85,7 +88,6 @@ class RLTrainer(LayoutTrainer):
         std_y = centers[..., 1].std(dim=1)
         
         # [策略] 设定上限 (0.8)，防止模型为了刷分把物体无限推向边缘
-        # 这里需要 unsqueeze(1) 是因为 std 降维了，变成了 [B]，要变回 [B, 1] 才能和 [B, T] 相乘
         disp_score = torch.clamp(std_x + std_y, max=0.8).unsqueeze(1) # [B, 1]
         
         r_disp = disp_score * no_gt_mask * self.w_dispersion
@@ -103,23 +105,22 @@ class RLTrainer(LayoutTrainer):
         dist_y_third = torch.min(torch.abs(cy - 0.333), torch.abs(cy - 0.667))
         
         # 距离越小，奖励越高。距离大于 0.2 时奖励归零。
-        # r_composition 本身就是 [B, T]
         r_composition = (0.2 - (dist_x_third + dist_y_third)).clamp(min=0) * 2.5
         
-        # [BUG FIX] 移除 .unsqueeze(1)，因为 r_composition 已经是 [B, T]
         obj_rewards += r_composition * no_gt_mask
 
         # ===========================================================
-        # E. 边缘惩罚 (Border Penalty)
+        # E. 边缘惩罚 (Border Penalty) [Modified]
         # ===========================================================
-        # 严厉惩罚贴边行为 (margin = 0.05)
+        # [修复] 扩大边缘禁区并加大惩罚，防止模型为了刷 Dispersion 分数而将物体推向死角（左上/右下）
         dist_to_edge = torch.min(centers, 1.0 - centers) # [B, T, 2]
-        is_too_close_to_edge = (dist_to_edge < 0.05).float().sum(dim=-1) # [B, T]
         
-        # r_border_penalty 本身就是 [B, T]
-        r_border_penalty = is_too_close_to_edge * -1.0 # 每次违规扣 1 分
+        # 将禁区从 0.05 扩大到 0.1
+        is_too_close_to_edge = (dist_to_edge < 0.1).float().sum(dim=-1) # [B, T]
         
-        # [BUG FIX] 移除 .unsqueeze(1)
+        # 将惩罚从 -1.0 加大到 -2.0
+        r_border_penalty = is_too_close_to_edge * -2.0 
+        
         obj_rewards += r_border_penalty
 
         # ===========================================================
@@ -134,7 +135,7 @@ class RLTrainer(LayoutTrainer):
             'IoU': (r_iou.sum() / (loss_mask.sum() + 1e-6)).item(),
             'Rel': (r_rel.sum() / (no_gt_mask.sum() + 1e-6)).item(),
             'Disp': disp_score.mean().item(),
-            'Comp': r_composition.mean().item(), # Composition Score
+            'Comp': r_composition.mean().item(),
             'Over': overlap_penalty.mean().item()
         }
 
@@ -239,13 +240,14 @@ class RLTrainer(LayoutTrainer):
             print(f"[Warning] Could not save reward plot: {e}")
 
     def train_rl_epoch(self, epoch):
-        """执行一个 Epoch 的 SCST 训练"""
+        """
+        执行一个 Epoch 的 Mixed Training (RL + Supervised Anchor)
+        """
         self.model.train()
         total_reward = 0
-        total_loss = 0
         steps = 0
         
-        print(f"\n--- [RL] Starting RL Epoch {epoch+1} (SCST) ---")
+        print(f"\n--- [RL] Starting RL Epoch {epoch+1} (Mixed Training) ---")
         
         for step, batch in enumerate(self.train_loader):
             # 1. 数据移至 GPU
@@ -254,8 +256,9 @@ class RLTrainer(LayoutTrainer):
                     batch[k] = v.to(self.device)
             
             # ==========================================
-            # 步骤 1: Baseline (Greedy Search)
+            # Part A: Reinforcement Learning (RL)
             # ==========================================
+            # 1. Baseline (Greedy)
             self.model.eval()
             with torch.no_grad():
                 baseline_boxes, _ = self.model.forward_rl(
@@ -265,9 +268,7 @@ class RLTrainer(LayoutTrainer):
                 )
                 reward_baseline = self.compute_reward(baseline_boxes, batch)
             
-            # ==========================================
-            # 步骤 2: Sampling (Exploration)
-            # ==========================================
+            # 2. Sampling (Exploration)
             self.model.train()
             sample_boxes, log_probs = self.model.forward_rl(
                 batch['input_ids'], batch['attention_mask'], batch['kg_class_ids'], 
@@ -276,28 +277,66 @@ class RLTrainer(LayoutTrainer):
             )
             reward_sample = self.compute_reward(sample_boxes, batch)
             
-            # ==========================================
-            # 步骤 3: 优势函数与梯度更新
-            # ==========================================
+            # 3. Advantage
             advantage = reward_sample - reward_baseline
-            
             log_prob_sum = log_probs.sum(dim=1)
-            loss = -(log_prob_sum * advantage).mean()
+            rl_loss = -(log_prob_sum * advantage).mean()
+            
+            # ==========================================
+            # Part B: Supervised Anchor (Mixed Training)
+            # [关键修复] 通过混合监督损失，强制模型保留对尺寸、位置先验的记忆
+            # ==========================================
+            # 1. 执行标准前向传播 (Teacher Forcing / CVAE)
+            mu, logvar, pred_boxes_sup, _ = self.model(
+                batch['input_ids'], batch['attention_mask'], batch['kg_class_ids'], 
+                batch['padding_mask'], batch['kg_spatial_matrix'], batch['location_grids'],
+                target_boxes=batch['target_boxes'] # 传入 GT 用于 Encoder
+            )
+            
+            # 2. 计算监督损失 (包含 Regression, IoU, Size Prior 等)
+            # 注意: get_loss 返回的第一个元素是 total_loss
+            loss_tuple = self.model.get_loss(
+                pred_cls=None, pred_bbox_ids=None, 
+                pred_boxes=pred_boxes_sup, # 使用监督路径的预测值
+                pred_count=None, layout_seq=None, 
+                layout_mask=batch['loss_mask'], 
+                num_boxes=batch['num_boxes'].to(self.device), 
+                target_coords_gt=batch['target_boxes'],
+                kg_spatial_matrix=batch['kg_spatial_matrix'],
+                kg_class_weights=batch['kg_class_weights'],
+                kg_class_ids=batch['kg_class_ids']
+            )
+            supervised_loss = loss_tuple[0]
+            
+            # 3. 计算 KL 散度 (CVAE 正则)
+            if mu is not None and logvar is not None:
+                kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
+            else:
+                kl_loss = torch.tensor(0.0, device=self.device)
+
+            # ==========================================
+            # Part C: 总损失融合与更新
+            # ==========================================
+            # alpha: 控制 RL 探索的激进程度 (0.1 表示主要还是保持原有知识，微调探索)
+            alpha = 0.1 
+            
+            # 最终 Loss = RL探索 + 监督信号(尺寸/位置约束) + VAE正则
+            total_combined_loss = alpha * rl_loss + (1.0 * supervised_loss + 0.005 * kl_loss)
             
             self.optimizer.zero_grad()
-            loss.backward()
+            total_combined_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.optimizer.step()
             
             total_reward += reward_sample.mean().item()
-            total_loss += loss.item()
             steps += 1
             
             if (step + 1) % 10 == 0:
                 stats = self.last_reward_stats
                 print(f"[RL] Epoch {epoch+1} Step {step+1} | "
                       f"R_Avg: {reward_sample.mean().item():.3f} | "
-                      f"Adv: {advantage.mean().item():.3f} || "
+                      f"Adv: {advantage.mean().item():.3f} | "
+                      f"Loss: {total_combined_loss.item():.4f} || "
                       f"IoU:{stats.get('IoU', 0):.2f} "
                       f"Rel:{stats.get('Rel', 0):.2f} "
                       f"Disp:{stats.get('Disp', 0):.2f} "

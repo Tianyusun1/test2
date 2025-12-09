@@ -1,11 +1,11 @@
-# File: tianyusun1/test2/test2-5.2/configs/default.yaml (V5.6: Updated RL Params)
+# File: tianyusun1/test2/test2-5.2/configs/default.yaml (V5.10: Adjusted for Mixed RL)
 
 model:
   # BERT encoder
   bert_path: "/home/sty/pyfile/huggingface/bert-base-chinese"
   hidden_size: 768
   # Layout decoder
-  bb_size: 128            # 保持高维度，显存够大没问题
+  bb_size: 128            
   decoder_layers: 6
   decoder_heads: 8
   dropout: 0.3
@@ -13,7 +13,7 @@ model:
   num_classes: 9
   
   # === CVAE Parameters ===
-  latent_dim: 64          # [Confirmed] 使用 64 维潜在空间增强多样性
+  latent_dim: 64          
 
   # --- Legacy Discrete Parameters ---
   num_bbox_bins: 1000
@@ -35,7 +35,7 @@ model:
   # 3. 聚类约束 (Clustering)
   clustering_loss_weight: 1.0
   
-  # 4. 审美约束 (Aesthetic) - 监督阶段建议设为 0 或很小，交给 RL 去优化
+  # 4. 审美约束 (Aesthetic)
   alignment_loss_weight: 0.0 
   balance_loss_weight: 0.0   
   
@@ -47,7 +47,7 @@ model:
   # Inference
   max_elements: 30
   
-  # Data paths (Updated)
+  # Data paths
   xlsx_path: "/home/sty/pyfile/Layout2Paint5.3.1/dataset/6800poems.xlsx"
   images_dir: "/home/sty/pyfile/Layout2Paint5.3.1/dataset/6800"
   labels_dir: "/home/sty/pyfile/Layout2Paint5.3.1/dataset/6800/JPEGImages-pre_new_txt"
@@ -56,33 +56,40 @@ model:
 
 training:
   # === Stage 1: Supervised Pre-training ===
-  batch_size: 128         # [Modified] 显存大就开大，由 64 -> 128
-  epochs: 200             # [Modified] 6000张图数据量较小，增加轮数以保证收敛
+  batch_size: 128         
+  epochs: 200             
   learning_rate: 0.0001
-  warmup_steps: 1000      # 约 20 个 Epoch 的 Warmup (1000 / 47)
+  warmup_steps: 1000      
   
   # Logging & Saving
-  save_every: 50          # 每 50 轮存一次检查点
+  save_every: 50          
   output_dir: "./outputs/rl"
   log_steps: 10
-  visualize_every: 5      # [Modified] 200轮太多了，每5轮画一次图即可，避免刷屏
+  visualize_every: 5      
 
-  # === Stage 2: RL Fine-tuning Configuration ===
-  # 这些参数将在 scripts/train.py 中被读取用于 RL 阶段
-  rl_epochs: 200          # [NEW] RL 微调轮数
-  rl_learning_rate: 5e-6  # [NEW] RL 学习率 (通常比 SL 低 1-2 个数量级)
+  # === Stage 2: RL Fine-tuning Configuration (CRITICAL UPDATES) ===
+  # [修改点 1] 学习率保持低位，防止遗忘
+  rl_epochs: 300          # 100 轮通常足够微调
+  rl_learning_rate: 5e-6  # 保持微小的学习率
   
   # RL Rewards Weights (可以在这里集中管理)
   reward_weights:
-    iou: 2.0              # 稳住有标注的数据
-    relation: 1.5         # 核心：奖励符合 KG 逻辑的无标注物体
-    dispersion: 3.0       # 核心：奖励分散布局，解决中心堆积
-    overlap: -0.5         # 惩罚重叠
+    iou: 2.0              # [核心] 保持高权重，稳住有标注的数据
+    relation: 2.0         # [增强] 提高关系奖励，让模型更关注逻辑（如：鸟在天上）
+    
+    # [修改点 2] 大幅降低 Dispersion
+    # 原来是 3.0，导致模型为了刷分把物体扔到四角。
+    # 降为 0.5，只作为轻微的“辅助”，而不是“主宰”。
+    dispersion: 0.5       
+    
+    overlap: -0.5         # 惩罚重叠 (负分)
 
 inference:
   max_output_length: 30
 
+
 #python scripts/train.py
+
 # python scripts/train.py \
 #     --rl_tuning \
 #     --checkpoint /home/sty/pyfile/Layout2Paint5.3.1/outputs/model_epoch_200_val_loss_0.9073.pth
