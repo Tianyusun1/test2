@@ -1,12 +1,13 @@
-# File: tianyusun1/test2/test2-cc8b0f0a73b00d0c96a3d267fe297e6b8a7891be/scripts/train.py
+# File: scripts/train.py (V5.6: Adapted for CVAE & RL Training - Full Version)
 
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
 import os
+import argparse 
 
 # 获取当前脚本 (train.py) 的绝对路径
 current_script_path = os.path.abspath(__file__)
-# 获取项目根目录 (train.py 的父目录)
+# 获取项目根目录 (train.py 的父目录的父目录)
 project_root = os.path.dirname(os.path.dirname(current_script_path))
 # 将项目根目录插入到 sys.path 的开头
 sys.path.insert(0, project_root)
@@ -19,17 +20,15 @@ from transformers import BertTokenizer
 from data.dataset import PoegraphLayoutDataset, layout_collate_fn 
 from models.poem2layout import Poem2LayoutGenerator
 import trainers 
+from trainers.rl_trainer import RLTrainer # 确保你有这个文件，或者使用新的 RL 逻辑
 from collections import Counter
 import numpy as np 
 
 # --- 辅助函数：计算类别权重 (解决类别偏差问题) ---
-# **已修改: 确保返回 10 个权重 (1 个 EOS + 9 个元素)**
 def compute_class_weights(dataset, num_classes: int, max_weight_ratio: float = 3.0):
     """
     计算数据集内所有布局元素的类别频率，并返回反向频率权重。
-    
-    MODIFIED: 返回 (num_classes + 1) 个权重，其中索引 0 对应 EOS。
-    num_classes: 9 (元素的数量)
+    返回 (num_classes + 1) 个权重，其中索引 0 对应 EOS。
     """
     element_class_counts = Counter()
     
@@ -87,14 +86,23 @@ def compute_class_weights(dataset, num_classes: int, max_weight_ratio: float = 3
 
 
 def main():
+    # [NEW] 添加命令行参数解析
+    parser = argparse.ArgumentParser(description="Train or RL-Finetune Poem2Layout (V5.6)")
+    parser.add_argument('--rl_tuning', action='store_true', help="Enable Reinforcement Learning fine-tuning mode")
+    parser.add_argument('--checkpoint', type=str, default=None, help="Path to pretrained model checkpoint (required for RL tuning)")
+    args = parser.parse_args()
+
     # 1. Load config
-    config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "configs/default.yaml")
+    config_path = os.path.join(project_root, "configs/default.yaml")
+    print(f"Loading config from: {config_path}")
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
     # 2. Init tokenizer and load FULL dataset for weight calculation
     model_config = config['model']
+    train_config = config['training'] # 获取 training 配置块
     
+    print("Initializing Dataset...")
     # 重新初始化数据集以确保数据完整性
     dataset = PoegraphLayoutDataset(
         xlsx_path=model_config['xlsx_path'],
@@ -108,30 +116,45 @@ def main():
     num_element_classes = model_config['num_classes'] # 9
     class_weights_tensor = compute_class_weights(dataset, num_element_classes)
     
-    # **修改 2.1: 修正打印输出，反映新的 10 类权重**
     print(f"Calculated Class Weights (Internal 0:EOS, 1-9:Elements 2-10): {class_weights_tensor.tolist()}")
     # ---------------------------
 
-    # 3. Init model (传入所有损失权重，包括新增的 Reg, Cls, Count, Area)
+    # 3. Init model (传入所有损失权重，包括新增的 Clustering Loss)
+    # [V5.6 Update]: 移除了 num_bbox_bins, bbox_embed_dim 等离散化参数
+    print(f"Initializing model with latent_dim={model_config.get('latent_dim', 32)}...")
     model = Poem2LayoutGenerator(
         bert_path=model_config['bert_path'],
         num_classes=num_element_classes, # 实际元素类别数 (9)
-        # --- NEW: BBox Discrete Parameters ---
-        num_bbox_bins=model_config['num_bbox_bins'],
-        bbox_embed_dim=model_config['bbox_embed_dim'],
-        # --------------------------------------
         hidden_size=model_config['hidden_size'],
         bb_size=model_config['bb_size'],
         decoder_layers=model_config['decoder_layers'],
         decoder_heads=model_config['decoder_heads'],
         dropout=model_config['dropout'],
-        # --- 传入所有损失权重 ---
-        coord_loss_weight=model_config['coord_loss_weight'],
+        
+        # === CVAE 参数 ===
+        latent_dim=model_config.get('latent_dim', 32),
+        
+        # --- 传入所有损失权重 (Updated for V5.6) ---
+        reg_loss_weight=model_config.get('reg_loss_weight', 1.0),
         iou_loss_weight=model_config.get('iou_loss_weight', 1.0), 
-        reg_loss_weight=model_config.get('reg_loss_weight', 1.0),    # 传入 reg_loss_weight
-        cls_loss_weight=model_config.get('cls_loss_weight', 1.0),    # 传入 cls_loss_weight
-        count_loss_weight=model_config.get('count_loss_weight', 1.0),# 传入 count_loss_weight
-        area_loss_weight=model_config.get('area_loss_weight', 1.0),  # <<<< 新增: 传入 area_loss_weight
+        area_loss_weight=model_config.get('area_loss_weight', 1.0),
+        
+        # 核心逻辑权重
+        relation_loss_weight=model_config.get('relation_loss_weight', 5.0),
+        overlap_loss_weight=model_config.get('overlap_loss_weight', 3.0),
+        size_loss_weight=model_config.get('size_loss_weight', 2.0),
+        
+        # 审美权重
+        alignment_loss_weight=model_config.get('alignment_loss_weight', 0.5), # 默认给一点权重
+        balance_loss_weight=model_config.get('balance_loss_weight', 0.5),
+        
+        # [NEW V5.4] 聚类损失权重
+        clustering_loss_weight=model_config.get('clustering_loss_weight', 1.0),
+        
+        # [NEW V5.6] 辅助损失
+        count_loss_weight=model_config.get('count_loss_weight', 1.0),
+        kl_loss_weight=model_config.get('kl_loss_weight', 0.1), # KL 权重
+        
         class_weights=class_weights_tensor 
         # -----------------------------------------
     )
@@ -148,24 +171,33 @@ def main():
     )
     print(f"Dataset split: Train={train_size}, Validation={val_size}, Test={test_size}")
 
+    # [NOTE] Batch Size 读取自配置文件，请确保 yaml 中 batch_size 已设置为 128
+    batch_size = train_config['batch_size']
+    print(f"Using Batch Size: {batch_size}")
+
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config['training']['batch_size'],
+        batch_size=batch_size,
         shuffle=True,
-        collate_fn=layout_collate_fn 
+        collate_fn=layout_collate_fn,
+        num_workers=4, # 大批量数据建议开启多线程加载
+        pin_memory=True
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config['training']['batch_size'],
+        batch_size=batch_size,
         shuffle=False,
-        collate_fn=layout_collate_fn 
+        collate_fn=layout_collate_fn,
+        num_workers=4,
+        pin_memory=True
     )
-    # 增加测试集加载器
     test_loader = DataLoader(
         test_dataset,
-        batch_size=config['training']['batch_size'],
+        batch_size=batch_size,
         shuffle=False,
-        collate_fn=layout_collate_fn 
+        collate_fn=layout_collate_fn,
+        num_workers=4,
+        pin_memory=True
     )
     
     # --- 获取 tokenizer 和一个固定样例 ---
@@ -174,20 +206,103 @@ def main():
     example_idx_in_full_dataset = val_dataset.indices[0]
     example_poem = dataset.data[example_idx_in_full_dataset]
     
-    # **已修改: 打印固定推理样例的 KG 向量**
-    kg_vector_example = dataset.pkg.extract_visual_feature_vector(example_poem['poem'])
+    # **打印固定推理样例的 KG 向量和空间矩阵**
+    # 这对于调试 RL 是否能获取到 Relation Reward 非常重要
     print("\n---------------------------------------------------")
     print(f"Inference Example Poem: '{example_poem['poem']}'")
     print(f"Inference Example GT Boxes: {example_poem['boxes']}")
     print("-------------------- KG DEBUG ---------------------")
-    # 内部 ID 0-8 对应原始 ID 2-10
-    print(f"KG Vector (0:mountain(2), 1:water(3), ..., 8:animal(10)): {kg_vector_example.tolist()}")
+    
+    # 1. 视觉向量
+    if hasattr(dataset, 'pkg'):
+        kg_vector_example = dataset.pkg.extract_visual_feature_vector(example_poem['poem'])
+        print(f"KG Vector (0:mountain(2), 1:water(3), ..., 8:animal(10)): {kg_vector_example.tolist()}")
+        
+        # 2. [NEW] 空间矩阵
+        kg_spatial_matrix_example = dataset.pkg.extract_spatial_matrix(example_poem['poem'])
+        print("Spatial Matrix (9x9):")
+        # print(kg_spatial_matrix_example) # Matrix might be large, print summary or raw
+        print(f"Spatial Matrix Shape: {kg_spatial_matrix_example.shape}")
     print("---------------------------------------------------\n")
 
-    # 5. Init trainer and start training
-    # 将 test_loader 传递给 Trainer
-    trainer = trainers.LayoutTrainer(model, train_loader, val_loader, config, tokenizer, example_poem, test_loader)
-    trainer.train()
+    # 5. Logic Branch: RL Tuning OR Supervised Training
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    if args.rl_tuning:
+        print("\n=======================================================")
+        print(">>> ENTERING RL FINE-TUNING MODE (SCST) <<<")
+        print("=======================================================\n")
+        
+        # 1. 必须加载预训练模型
+        if args.checkpoint is None:
+            raise ValueError("RL tuning requires a pretrained checkpoint! Use --checkpoint")
+        
+        print(f"Loading pretrained model from {args.checkpoint}...")
+        # map_location 确保在 CPU/GPU 间迁移兼容
+        checkpoint = torch.load(args.checkpoint, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # 2. 读取 RL 配置参数 [FIXED: 强制类型转换]
+        # 务必转为 float 和 int，防止 YAML 解析为 string 导致 optimizer 报错
+        rl_lr = float(train_config.get('rl_learning_rate', 5e-6))
+        rl_epochs = int(train_config.get('rl_epochs', 50))
+        
+        print(f"RL Config -> Learning Rate: {rl_lr:.2e} (float) | Epochs: {rl_epochs} (int)")
+
+        # 3. 初始化 RLTrainer
+        trainer = RLTrainer(model, train_loader, val_loader, config, tokenizer, example_poem, test_loader)
+        
+        # 4. 强制覆盖优化器的学习率
+        for param_group in trainer.optimizer.param_groups:
+            param_group['lr'] = rl_lr
+        
+        # [NEW] 初始化最佳奖励记录
+        best_reward = -float('inf')
+
+        # 5. 开始 RL 训练循环
+        for epoch in range(rl_epochs):
+            # [MODIFIED] 接收 train_rl_epoch 返回的 avg_reward
+            avg_reward = trainer.train_rl_epoch(epoch)
+            
+            # [NEW] 可视化：每轮 RL 结束生成一张样例图，直观看到模型变化
+            # print(f"--- Visualizing RL Progress (Epoch {epoch+1}) ---")
+            # 调用 Trainer 内部的推理函数，它会生成 png 到 outputs/
+            trainer._run_inference_example(epoch)
+            
+            # === [NEW] 保存逻辑 A: 保存最棒的模型 (Best Reward) ===
+            # 这是 infer.py 优先加载的模型
+            if avg_reward > best_reward:
+                best_reward = avg_reward
+                best_save_path = os.path.join(train_config['output_dir'], "rl_best_reward.pth")
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'epoch': epoch,
+                    'avg_reward': avg_reward,
+                    'optimizer_state_dict': trainer.optimizer.state_dict(),
+                    'rl_config': {'lr': rl_lr}
+                }, best_save_path)
+                print(f"🌟 [New Best] Avg Reward {avg_reward:.4f} achieved! Model saved to {best_save_path}")
+
+            # === [MODIFIED] 保存逻辑 B: 每 10 个 Epoch 保存一次 ===
+            if (epoch + 1) % 10 == 0:
+                rl_save_path = os.path.join(train_config['output_dir'], f"rl_finetuned_epoch_{epoch+1}.pth")
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'epoch': epoch,
+                    'avg_reward': avg_reward,
+                    'optimizer_state_dict': trainer.optimizer.state_dict(),
+                    'rl_config': {'lr': rl_lr}
+                }, rl_save_path)
+                print(f"💾 [Checkpoint] Epoch {epoch+1} saved to {rl_save_path}")
+                
+    else:
+        # 原有的监督训练逻辑
+        print(">>> Starting Standard Supervised Training <<<")
+        print(f"Total Epochs: {train_config['epochs']} | Batch Size: {batch_size}")
+        
+        # 使用标准的 LayoutTrainer (适配 V5.6)
+        trainer = trainers.LayoutTrainer(model, train_loader, val_loader, config, tokenizer, example_poem, test_loader)
+        trainer.train()
 
 if __name__ == "__main__":
     main()

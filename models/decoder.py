@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from typing import Optional, Tuple
 from .transformer_layers import PoemLayoutDecoderLayer
 
 class LayoutDecoder(nn.Module):
@@ -8,6 +9,7 @@ class LayoutDecoder(nn.Module):
         if ff_size is None:
             ff_size = hidden_size * 4
         self.bb_size = bb_size
+        self.hidden_size = hidden_size
         
         self.layers = nn.ModuleList([
             PoemLayoutDecoderLayer(
@@ -20,34 +22,63 @@ class LayoutDecoder(nn.Module):
         ])
         
         # The final layer norm input size is hidden_size + bb_size
+        # 因为最后我们将 text_x 和 layout_x 进行了拼接
         self.layer_norm = nn.LayerNorm(hidden_size + bb_size, eps=1e-6)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, layout_embed: torch.Tensor, text_features: torch.Tensor, src_mask: torch.Tensor, trg_mask: torch.Tensor):
-        # layout_embed: [B, T, bb_size]
-        # text_features: [B, L_text, hidden_size]
-        B, T, bb_size_dim = layout_embed.shape
-        B_text, L_text, hidden_size_dim = text_features.shape
-
-        # === 关键修复区域 ===
-        # 1. 移除 BUG：原代码错误地将 [CLS] token 重复 T 次作为 text_x 的初始值。
-        # 2. 修复：将 text_x 初始化为零向量 (Zero Tensor)，避免 [CLS] token 污染自注意力上下文。
+    def forward(self, 
+                layout_embed: torch.Tensor, 
+                text_features: torch.Tensor, 
+                src_mask: Optional[torch.Tensor], 
+                trg_mask: Optional[torch.Tensor], 
+                spatial_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            layout_embed: [B, T, bb_size] - 布局的 Embedding (Geometry)
+            text_features: [B, L_text, hidden_size] - 文本编码器的输出 (Semantics)
+            src_mask: 针对 text_features 的掩码
+            trg_mask: 针对 layout 序列的自回归掩码
+            spatial_bias: [B, n_heads, T, T] - 相对位置偏置 (V5.2 Feature)
+        """
+        B, T, _ = layout_embed.shape
         
-        # text_x 流在初始时应为零，其信息将通过 PoemLayoutDecoderLayer 内部的 Cross-Attention 从 text_features 中获取。
-        text_x = torch.zeros(B, T, hidden_size_dim, device=layout_embed.device) 
+        # === 关键修复区域 (V5.3 Fix) ===
+        # 原问题：全 0 初始化导致第一层 Text 流缺乏语义引导。
+        # 修正：使用 BERT 的 [CLS] token (Index 0) 初始化 text_x 流。
+        
+        # 1. 提取 [CLS] token: [B, L_text, H] -> [B, 1, H]
+        # 确保 text_features 不为空
+        if text_features.size(1) == 0:
+             raise ValueError("text_features sequence length is 0, cannot extract CLS token.")
+             
+        cls_token = text_features[:, 0, :].unsqueeze(1)
+        
+        # 2. 扩展到序列长度 T: [B, 1, H] -> [B, T, H]
+        # 使用 clone() 确保后续 inplace 操作安全，避免梯度问题
+        text_x = cls_token.expand(-1, T, -1).clone()
         
         layout_x = layout_embed # [B, T, bb_size]
-        # 原有的 BUG 赋值语句 text_x = text_repr_for_layout 已被移除。
         # ==================
 
         # Iterate through the stack of layers
         for layer in self.layers:
-            # layout_x 和 text_x 都是 Query，text_features 是 Memory
-            layout_x, text_x = layer(layout_x, text_x, text_features, src_mask, trg_mask)
+            # layout_x 和 text_x 作为 Query 传入，text_features 作为 Memory
+            # [MODIFIED] Pass spatial_bias to each layer explicitly
+            layout_x, text_x = layer(
+                layout_x=layout_x, 
+                text_x=text_x, 
+                memory=text_features, 
+                src_mask=src_mask, 
+                trg_mask=trg_mask, 
+                spatial_bias=spatial_bias
+            )
 
         # After all layers, concatenate the final streams
+        # 最终输出融合了语义流(text_x)和几何流(layout_x)
         # Order: [text_features_stream, layout_features_stream]
         output = torch.cat([text_x, layout_x], dim=-1) # [B, T, hidden_size + bb_size]
+        
         output = self.layer_norm(output)
         output = self.dropout(output)
+        
         return output # [B, T, hidden_size + bb_size]
