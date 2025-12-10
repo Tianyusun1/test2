@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-5.2/trainers/rl_trainer.py (V5.14: Mixed Training + Stricter Constraints)
+# File: tianyusun1/test2/test2-5.2/trainers/rl_trainer.py (V5.18: Final Fix - No Unsqueeze)
 
 import torch
 import torch.nn.functional as F
@@ -13,9 +13,10 @@ class RLTrainer(LayoutTrainer):
     强化学习训练器 (RL Fine-tuning Trainer)。
     继承自 LayoutTrainer，复用了验证、保存模型等逻辑，
     但重写了训练循环以支持 SCST (Self-Critical Sequence Training)。
-    [V5.14 Updates] 
-    1. 引入 Mixed Training (RL + Supervised) 防止尺寸崩坏和灾难性遗忘。
-    2. 增强 Border Penalty 防止物体贴边（左上/右下扎堆）。
+    [V5.18 Updates] 
+    1. 修复 RuntimeError: 移除了 disp_score 的 unsqueeze(1)，解决广播错误。
+    2. 策略调整: 监督权重降为 0.3，移除 no_gt_mask，让 RL 信号覆盖全局。
+    3. 奖励优化: 使用最近邻距离计算分散度，密集化关系奖励。
     """
     def __init__(self, model, train_loader, val_loader, config, tokenizer, example_poem, test_loader):
         super().__init__(model, train_loader, val_loader, config, tokenizer, example_poem, test_loader)
@@ -31,8 +32,8 @@ class RLTrainer(LayoutTrainer):
         reward_cfg = config['training'].get('reward_weights', {})
         
         self.w_iou = float(reward_cfg.get('iou', 2.0))              
-        self.w_rel = float(reward_cfg.get('relation', 1.0))         
-        self.w_dispersion = float(reward_cfg.get('dispersion', 2.5)) 
+        self.w_rel = float(reward_cfg.get('relation', 5.0)) # 强语义约束       
+        self.w_dispersion = float(reward_cfg.get('dispersion', 0.5)) # 适度分散
         self.w_overlap = float(reward_cfg.get('overlap', -0.5))     
 
         # [NEW] 用于记录最近一次 batch 的奖励明细
@@ -70,27 +71,34 @@ class RLTrainer(LayoutTrainer):
         obj_rewards += r_iou
 
         # ===========================================================
-        # B. 关系奖励 (Relation Reward) - 解决“标注缺失”
+        # B. 关系奖励 (Relation Reward)
         # ===========================================================
-        no_gt_mask = 1.0 - loss_mask
-        
+        # [修改] 移除 no_gt_mask，让所有物体都受 KG 逻辑约束
+        # 这样即使是有 GT 的物体，如果符合逻辑也会得到额外奖励，增强梯度信号
         rel_scores = self._calculate_relation_reward(pred_boxes, kg_spatial_matrix, kg_class_ids) # [B, T]
-        r_rel = rel_scores * no_gt_mask * self.w_rel
+        r_rel = rel_scores * self.w_rel
         obj_rewards += r_rel
 
         # ===========================================================
-        # C. 分散度奖励 (Dispersion Reward) - 解决“中心堆积”
+        # C. 分散度奖励 (Dispersion Reward) - [FIXED] 改为最近邻距离
         # ===========================================================
         centers = pred_boxes[..., :2] # [B, T, 2]
         
-        # std_x: [B]
-        std_x = centers[..., 0].std(dim=1)
-        std_y = centers[..., 1].std(dim=1)
+        # 计算所有物体中心点之间的距离矩阵 [B, T, T]
+        dists = torch.cdist(centers, centers)
         
-        # [策略] 设定上限 (0.8)，防止模型为了刷分把物体无限推向边缘
-        disp_score = torch.clamp(std_x + std_y, max=0.8).unsqueeze(1) # [B, 1]
+        # 把对角线（自己到自己）设为一个大数，防止取最小值为0
+        eye = torch.eye(T, device=device).unsqueeze(0)
+        dists = dists + eye * 10.0
         
-        r_disp = disp_score * no_gt_mask * self.w_dispersion
+        # 找到每个物体离它最近的邻居的距离 [B, T]
+        min_dist, _ = dists.min(dim=2)
+        
+        # 奖励这个距离（距离越大，说明散得越开），但在 0.3 左右截断，不需要无限远
+        # [关键修复] 删除了 .unsqueeze(1)，因为 min_dist 已经是 [B, T]，不需要广播
+        disp_score = torch.clamp(min_dist, max=0.3) 
+        
+        r_disp = disp_score * self.w_dispersion
         obj_rewards += r_disp
 
         # ===========================================================
@@ -107,19 +115,19 @@ class RLTrainer(LayoutTrainer):
         # 距离越小，奖励越高。距离大于 0.2 时奖励归零。
         r_composition = (0.2 - (dist_x_third + dist_y_third)).clamp(min=0) * 2.5
         
-        obj_rewards += r_composition * no_gt_mask
+        obj_rewards += r_composition 
 
         # ===========================================================
         # E. 边缘惩罚 (Border Penalty) [Modified]
         # ===========================================================
-        # [修复] 扩大边缘禁区并加大惩罚，防止模型为了刷 Dispersion 分数而将物体推向死角（左上/右下）
+        # [修复] 缩小禁区，减小惩罚力度，防止模型死守中心
         dist_to_edge = torch.min(centers, 1.0 - centers) # [B, T, 2]
         
-        # 将禁区从 0.05 扩大到 0.1
-        is_too_close_to_edge = (dist_to_edge < 0.1).float().sum(dim=-1) # [B, T]
+        # 1. 将禁区从 0.1 缩小回 0.05 (5%)
+        is_too_close_to_edge = (dist_to_edge < 0.05).float().sum(dim=-1) # [B, T]
         
-        # 将惩罚从 -1.0 加大到 -2.0
-        r_border_penalty = is_too_close_to_edge * -2.0 
+        # 2. 将惩罚从 -2.0 降低到 -0.5
+        r_border_penalty = is_too_close_to_edge * -0.5 
         
         obj_rewards += r_border_penalty
 
@@ -130,10 +138,12 @@ class RLTrainer(LayoutTrainer):
         r_over = overlap_penalty * self.w_overlap
         obj_rewards += r_over
 
-        # [NEW] 记录明细
+        # [NEW] 记录明细 (仅供参考，不影响梯度)
+        # 注意：这里如果 tensor 形状不一致，item() 可能会报错，所以加 sum/mean
+        no_gt_mask = 1.0 - loss_mask
         self.last_reward_stats = {
             'IoU': (r_iou.sum() / (loss_mask.sum() + 1e-6)).item(),
-            'Rel': (r_rel.sum() / (no_gt_mask.sum() + 1e-6)).item(),
+            'Rel': (r_rel.sum() / (B * T)).item(), # 既然去掉了 no_gt_mask，分母改用总数
             'Disp': disp_score.mean().item(),
             'Comp': r_composition.mean().item(),
             'Over': overlap_penalty.mean().item()
@@ -187,22 +197,41 @@ class RLTrainer(LayoutTrainer):
                     box_i = boxes[b, i]
                     box_j = boxes[b, j]
                     
-                    satisfied = False
-                    if rel == 1 and box_i[1] < box_j[1]: satisfied = True # above
-                    elif rel == 2 and box_i[1] > box_j[1]: satisfied = True # below
-                    elif rel == 3: # inside
-                        dx = abs(box_i[0] - box_j[0])
-                        dy = abs(box_i[1] - box_j[1])
-                        if dx < box_j[2]/2 and dy < box_j[3]/2: satisfied = True
-                    elif rel == 4: # surrounds
-                        dx = abs(box_i[0] - box_j[0])
-                        dy = abs(box_i[1] - box_j[1])
-                        if dx < box_i[2]/2 and dy < box_i[3]/2: satisfied = True
+                    reward_val = 0.0
                     
-                    if satisfied:
-                        rewards[b, i] += 1.0 
+                    # [V5.15] 密集奖励逻辑：即使不完全满足，只要方向对了也给一点惩罚提示
+                    if rel == 1: # ABOVE (box_i y < box_j y)
+                        diff = box_j[1] - box_i[1] # 应该是正数
+                        if diff > 0: reward_val = 1.0
+                        else: reward_val = 0.2 * diff # 负数惩罚，距离越远惩罚越大
                         
-        return torch.clamp(rewards, max=3.0)
+                    elif rel == 2: # BELOW (box_i y > box_j y)
+                        diff = box_i[1] - box_j[1] # 应该是正数
+                        if diff > 0: reward_val = 1.0
+                        else: reward_val = 0.2 * diff
+                        
+                    elif rel == 3: # INSIDE
+                        dx = abs(box_i[0] - box_j[0])
+                        dy = abs(box_i[1] - box_j[1])
+                        # 简单逻辑：如果在范围内，满分
+                        if dx < box_j[2]/2 and dy < box_j[3]/2: 
+                            reward_val = 1.0
+                        
+                    elif rel == 4: # SURROUNDS (反向 Inside)
+                        dx = abs(box_i[0] - box_j[0])
+                        dy = abs(box_i[1] - box_j[1])
+                        if dx < box_i[2]/2 and dy < box_i[3]/2: 
+                            reward_val = 1.0
+                    
+                    # On Top (类似 Above 但更近)
+                    elif rel == 5: 
+                        diff = box_j[1] - box_i[1]
+                        if diff > 0: reward_val = 1.0
+                        else: reward_val = 0.2 * diff
+
+                    rewards[b, i] += reward_val
+                        
+        return torch.clamp(rewards, min=-1.0, max=3.0)
 
     def _calculate_overlap_penalty(self, boxes):
         """计算两两重叠惩罚"""
@@ -317,11 +346,12 @@ class RLTrainer(LayoutTrainer):
             # ==========================================
             # Part C: 总损失融合与更新
             # ==========================================
-            # alpha: 控制 RL 探索的激进程度 (0.1 表示主要还是保持原有知识，微调探索)
-            alpha = 0.1 
+            # [FIXED] alpha 提升至 1.0，让 RL 占据主导地位
+            alpha = 1.0 
             
+            # [FIXED] 降低 supervised 权重至 0.3，允许模型探索；保留 KL 0.05 维持多样性
             # 最终 Loss = RL探索 + 监督信号(尺寸/位置约束) + VAE正则
-            total_combined_loss = alpha * rl_loss + (1.0 * supervised_loss + 0.005 * kl_loss)
+            total_combined_loss = alpha * rl_loss + (0.3 * supervised_loss + 0.05 * kl_loss)
             
             self.optimizer.zero_grad()
             total_combined_loss.backward()

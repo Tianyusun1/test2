@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-5.2/configs/default.yaml (V5.10: Adjusted for Mixed RL)
+# File: tianyusun1/test2/test2-5.2/configs/default.yaml (V5.18: Final Optimized for RL Stability & 6K Data)
 
 model:
   # BERT encoder
@@ -47,7 +47,7 @@ model:
   # Inference
   max_elements: 30
   
-  # Data paths
+  # Data paths (Updated for 610-sty environment)
   xlsx_path: "/home/sty/pyfile/Layout2Paint5.3.1/dataset/6800poems.xlsx"
   images_dir: "/home/sty/pyfile/Layout2Paint5.3.1/dataset/6800"
   labels_dir: "/home/sty/pyfile/Layout2Paint5.3.1/dataset/6800/JPEGImages-pre_new_txt"
@@ -68,18 +68,20 @@ training:
   visualize_every: 5      
 
   # === Stage 2: RL Fine-tuning Configuration (CRITICAL UPDATES) ===
-  # [修改点 1] 学习率保持低位，防止遗忘
-  rl_epochs: 300          # 100 轮通常足够微调
-  rl_learning_rate: 5e-6  # 保持微小的学习率
+  # [修改点 1] 学习率适度调高 (2e-5)，打破"死守中心"的僵局
+  rl_epochs: 300          
+  rl_learning_rate: 2e-5  # 保持微小的学习率，但比 5e-6 大，允许参数变动
   
   # RL Rewards Weights (可以在这里集中管理)
   reward_weights:
     iou: 2.0              # [核心] 保持高权重，稳住有标注的数据
-    relation: 2.0         # [增强] 提高关系奖励，让模型更关注逻辑（如：鸟在天上）
     
-    # [修改点 2] 大幅降低 Dispersion
-    # 原来是 3.0，导致模型为了刷分把物体扔到四角。
-    # 降为 0.5，只作为轻微的“辅助”，而不是“主宰”。
+    # [关键修改] 大幅提高关系奖励 (5.0)，强迫模型"读懂"诗句逻辑
+    # 这是防止模型忽略输入、生成千篇一律布局的关键
+    relation: 5.0         
+    
+    # [修改点 2] 保持较低的分散度权重 (0.5)
+    # 代码中已改为计算"最近邻距离"，配合 0.5 的权重即可实现"不堆叠"且"不贴角"
     dispersion: 0.5       
     
     overlap: -0.5         # 惩罚重叠 (负分)
@@ -88,10 +90,10 @@ inference:
   max_output_length: 30
 
 
-#python scripts/train.py
 
+#python scripts/train.py
 # python scripts/train.py \
 #     --rl_tuning \
-#     --checkpoint /home/sty/pyfile/Layout2Paint5.3.1/outputs/model_epoch_200_val_loss_0.9073.pth
+#     --checkpoint outputs/model_best_val_loss_1.234.pth
 
 #python scripts/infer.py --num_samples 5 --mode sample

@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-5.2/scripts/train.py (V5.9: RL Save Logic Updated)
+# File: tianyusun1/test2/test2-5.2/scripts/train.py (V5.18: Final RL Loop & Saving Logic)
 
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
@@ -207,6 +207,7 @@ def main():
     example_poem = dataset.data[example_idx_in_full_dataset]
     
     # **打印固定推理样例的 KG 向量和空间矩阵**
+    # 这对于调试 RL 是否能获取到 Relation Reward 非常重要
     print("\n---------------------------------------------------")
     print(f"Inference Example Poem: '{example_poem['poem']}'")
     print(f"Inference Example GT Boxes: {example_poem['boxes']}")
@@ -262,11 +263,12 @@ def main():
             avg_reward = trainer.train_rl_epoch(epoch)
             
             # [NEW] 可视化：每轮 RL 结束生成一张样例图，直观看到模型变化
-            print(f"--- Visualizing RL Progress (Epoch {epoch+1}) ---")
+            # print(f"--- Visualizing RL Progress (Epoch {epoch+1}) ---")
             # 调用 Trainer 内部的推理函数，它会生成 png 到 outputs/
             trainer._run_inference_example(epoch)
             
             # === [NEW] 保存逻辑 A: 保存最棒的模型 (Best Reward) ===
+            # 这是 infer.py 优先加载的模型
             if avg_reward > best_reward:
                 best_reward = avg_reward
                 best_save_path = os.path.join(train_config['output_dir'], "rl_best_reward.pth")

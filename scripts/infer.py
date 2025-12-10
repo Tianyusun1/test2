@@ -1,4 +1,4 @@
-# File: tianyusun1/test2/test2-5.2/scripts/infer.py (V5.7 → V5.8: BATCH INFERENCE FOR 50 POEMS)
+# File: tianyusun1/test2/test2-5.2/scripts/infer.py (V5.9: Auto-load Best RL Model)
 
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
@@ -84,9 +84,25 @@ def sanitize_filename(text, max_len=30):
     return cleaned[:max_len].strip('_').replace('__', '_') or "poem"
 
 def find_best_checkpoint(output_dir):
+    """
+    自动查找最佳检查点。
+    优先级：
+    1. rl_best_reward.pth (RL微调后的最佳奖励模型)
+    2. rl_finetuned_epoch_X.pth (最新的 RL 模型)
+    3. model_best_val_loss.pth (监督训练的最佳 Loss 模型)
+    4. model_epoch_X.pth (最新的监督训练模型)
+    """
     if not os.path.exists(output_dir):
         return None
     files = [f for f in os.listdir(output_dir) if f.endswith('.pth')]
+    
+    # [NEW] 优先级 1: RL 最佳奖励模型
+    if "rl_best_reward.pth" in files:
+        checkpoint_path = os.path.join(output_dir, "rl_best_reward.pth")
+        print(f"[Auto-Resume] Found Best RL Reward model: {checkpoint_path}")
+        return checkpoint_path
+
+    # 优先级 2: RL 微调过程中的 Checkpoint
     rl_checkpoints = []
     for f in files:
         if "rl_finetuned" in f:
@@ -96,12 +112,16 @@ def find_best_checkpoint(output_dir):
                 rl_checkpoints.append((epoch_num, os.path.join(output_dir, f)))
     if rl_checkpoints:
         rl_checkpoints.sort(key=lambda x: x[0], reverse=True)
-        print(f"[Auto-Resume] Found RL finetuned model: {rl_checkpoints[0][1]}")
+        print(f"[Auto-Resume] Found latest RL finetuned model: {rl_checkpoints[0][1]}")
         return rl_checkpoints[0][1]
+    
+    # 优先级 3: 监督训练最佳验证集模型
     best_models = [f for f in files if "best_val_loss" in f]
     if best_models:
         print(f"[Auto-Resume] Found Best Val Loss model: {os.path.join(output_dir, best_models[0])}")
         return os.path.join(output_dir, best_models[0])
+    
+    # 优先级 4: 监督训练普通 Checkpoint
     epoch_models = []
     for f in files:
         if "model_epoch_" in f and "rl" not in f:
@@ -113,6 +133,7 @@ def find_best_checkpoint(output_dir):
         epoch_models.sort(key=lambda x: x[0], reverse=True)
         print(f"[Auto-Resume] Found latest supervised model: {epoch_models[0][1]}")
         return epoch_models[0][1]
+        
     return None
 
 def main():
@@ -121,7 +142,7 @@ def main():
     parser.add_argument("--mode", type=str, default="sample", choices=["greedy", "sample"], help="Decoding mode")
     parser.add_argument("--top_k", type=int, default=3, help="Top-K for sampling")
     parser.add_argument("--num_samples", type=int, default=3, help="Number of samples per poem")
-    parser.add_argument("--checkpoint", type=str, default="/home/sty/pyfile/Layout2Paint5.3.1/outputs/rl/rl_finetuned_epoch_110.pth", help="Path to specific checkpoint")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to specific checkpoint (default: auto-find best)")
     args = parser.parse_args()
 
     # Load config
