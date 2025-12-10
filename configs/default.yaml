@@ -1,47 +1,99 @@
-# File: tianyusun1/test2/test2-bbb825395418d78edd547068aa7210d1e2c95933/configs/default.yaml
+# File: tianyusun1/test2/test2-5.2/configs/default.yaml (V5.22: Robust RL & Anti-Collapse Config)
 
 model:
   # BERT encoder
-  bert_path: "/home/610-sty/huggingface/bert-base-chinese"
-  hidden_size: 768  # BERT hidden size
+  bert_path: "/home/sty/pyfile/huggingface/bert-base-chinese"
+  hidden_size: 768
   # Layout decoder
-  bb_size: 64       
-  decoder_layers: 6       
+  bb_size: 128            
+  decoder_layers: 6
   decoder_heads: 8
-  dropout: 0.2      
+  dropout: 0.3
   # Output
-  num_classes: 9    
+  num_classes: 9
   
-  # --- DISCRETE BBOX PARAMETERS (NEW) ---
-  num_bbox_bins: 1000       
-  cls_embed_dim: 16         
-  bbox_embed_dim: 12        
-  iou_loss_weight: 10.0     # <<<< 修改: IOU 排斥损失权重 (5.0 -> 100.0)
-  # --------------------------------------
+  # === CVAE Parameters ===
+  latent_dim: 64          
+
+  # --- Legacy Discrete Parameters ---
+  num_bbox_bins: 1000
+  cls_embed_dim: 32
+  bbox_embed_dim: 24
+  # -----------------------------------------------------------
+
+  # === LOSS WEIGHTS (SUPERVISED STAGE) ===
+  # [Stage 1 策略] 监督阶段稍微降低关系权重，防止模型在预训练时就陷入死板布局
+  reg_loss_weight: 2.0      
+  iou_loss_weight: 2.0      
+  area_loss_weight: 1.0     
   
-  coord_loss_weight: 1.0     # BBox Token 分类损失
-  reg_loss_weight: 50.0       # 连续回归损失权重
-  cls_loss_weight: 5.0     # 分类损失权重
-  count_loss_weight: 10.0   # <<<< 新增: 数量预测损失权重
-  area_loss_weight: 10.0    # <<<< 新增: 面积惩罚权重 (惩罚大框)
+  # [修改] 关系权重降为 2.0 (原 5.0)，防止过拟合
+  relation_loss_weight: 2.0 
+  overlap_loss_weight: 2.0  
+  size_loss_weight: 1.0     
+  
+  # 3. 聚类约束 (Clustering)
+  clustering_loss_weight: 0.5 
+  
+  # 4. 审美约束 (Aesthetic)
+  alignment_loss_weight: 0.1 
+  balance_loss_weight: 0.1   
+  
+  # Legacy weights
+  coord_loss_weight: 0.0    
+  cls_loss_weight: 0.0      
+  count_loss_weight: 0.0    
+
   # Inference
-  max_elements: 30 
-  # Data paths
-  xlsx_path: "/home/610-sty/Layout2Paint/dataset/6800poems.xlsx"
-  images_dir: "/home/610-sty/Layout2Paint/dataset/6800"
-  labels_dir: "/home/610-sty/Layout2Paint/dataset/6800/JPEGImages-pre_new_txt"
+  max_elements: 30
+  
+  # Data paths (保持你的环境路径不变)
+  xlsx_path: "/home/sty/pyfile/Layout2Paint5.3.1/dataset/6800poems.xlsx"
+  images_dir: "/home/sty/pyfile/Layout2Paint5.3.1/dataset/6800"
+  labels_dir: "/home/sty/pyfile/Layout2Paint5.3.1/dataset/6800/JPEGImages-pre_new_txt"
   max_layout_length: 30
   max_text_length: 64
 
 training:
-  batch_size: 16
-  epochs: 100
-  learning_rate: 0.00005 
-  warmup_steps: 1000
-  save_every: 10 
-  output_dir: "./outputs"
+  # === Stage 1: Supervised Pre-training ===
+  batch_size: 128         
+  epochs: 200             
+  learning_rate: 0.0001
+  warmup_steps: 1000      
+  
+  # Logging & Saving
+  # [修改] 确保这里也是 50，保持一致
+  save_every: 50          
+  output_dir: "./outputs/rl" # [建议] 改名以区分新旧实验
   log_steps: 10
+  visualize_every: 5      
+
+  # === Stage 2: RL Fine-tuning Configuration (CRITICAL UPDATES) ===
+  # [修改] 增加轮数，确保有足够时间探索
+  rl_epochs: 500          
+  
+  # [关键修改] 提速！从 5e-6 提升到 2e-5 (0.00002)
+  # 之前的学习率太小，导致200轮都走不动
+  rl_learning_rate: 2e-5 
+  
+  # RL Rewards Weights [核心修改区]
+  reward_weights:
+    iou: 3.0              # [重] 核心指标，理解诗意
+    relation: 1.0         # [轻] 辅助约束，不要太强
+    
+    # [关键修改] 提升分散权重！从 0.5 -> 1.0
+    # 配合 Entropy Regularization，强迫物体散开
+    dispersion: 1.0       
+    
+    overlap: -1.0         # [重] 严厉惩罚重叠
+    composition: 0.5      # [轻] 构图美学
 
 inference:
   max_output_length: 30
-  # beam_size: 1
+
+#python scripts/train.py
+# python scripts/train.py \
+#     --rl_tuning \
+#     --checkpoint outputs/model_best_val_loss_1.234.pth
+
+#python scripts/infer.py --num_samples 5 --mode sample
